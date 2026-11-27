@@ -124,6 +124,108 @@ def test_day_utc_window_limits_gap_rows_and_marks_partial_canonical_minutes(repo
     assert all(row["kind"] != "acquisition_gap" or row["selected_seconds"] > 0 for row in rows)
 
 
+def test_failed_receiver_retains_verified_prefix_after_strict_replay(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request):
+    """A source-matched interrupted DAY prefix remains descriptive but incomplete."""
+    from pathlib import Path
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+    from cloud_network_benchmark.contracts.common import (DataValidity, ComparisonEligibility,
+        Evidence, GitSnapshot, StringEvidence)
+    from cloud_network_benchmark.validation import _acquisition_windows, _parse_unit, _validate_artifacts
+    from cloud_network_benchmark.analysis import _iperf_receiver_origin, _receiver_interval_bin
+
+    capture_seconds = 6 * 60 * 60
+    value, result, selection = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request, mode="diagnostic_day",
+        day_capture_seconds=capture_seconds)
+    assert value.execution_state == "failed" and value.cleanup_state == "succeeded"
+    assert value.failure is not None
+    assert result.validation_status.data_validity in {DataValidity.PARTIAL, DataValidity.INVALID}
+    assert result.validation_status.comparison_eligibility != ComparisonEligibility.ELIGIBLE
+    day_timing = next(item for item in value.timings if item.unit_id == "diagnostic-day")
+    assert (day_timing.measured_finished_at.value - day_timing.measured_started_at.value).total_seconds() == capture_seconds
+    assert len([unit for unit in value.measurement_units if unit.kind == "probe_chunk"]) == 72
+    client_command = next(command for command in value.commands
+        if command.request.get("action_id") == "iperf3-diagnostic-day")
+    receiver_launch = next(command for command in value.commands
+        if command.request.get("action_id") == "f02r-vm_b-listener-iperf3")
+    assert client_command.result["outcome"] == "failed" and receiver_launch.result["outcome"] == "succeeded"
+    assert client_command.request["argv"][client_command.request["argv"].index("-t") + 1] == "86400"
+    native_records = [record for record in value.artifact_records
+        if record.artifact_id in {"day-iperf3-client", "iperf3_server_log"}]
+    assert len(native_records) == 2
+    for record in native_records:
+        last_event = json.loads((Path(value.child_result_root) / record.path).read_text().splitlines()[-1])
+        assert last_event.get("event") != "end"
+    acquisition_findings = [item for item in result.findings if item.code == "provenance.acquisition_source_invalid"]
+    assert len(acquisition_findings) == 1 and "IncompleteAcquisitionTail" in acquisition_findings[0].message
+
+    day_origins = {}
+    day_windows, errors = _acquisition_windows(value, day_timing, verified_iperf_origins=day_origins)
+    assert len([window for window in day_windows if window[0] == "iperf3"]) == 1 and len(day_origins) == 1
+    _findings, records, _provenance = _validate_artifacts(value)
+    day_unit = next(unit for unit in value.measurement_units if unit.kind == "continuous_day")
+    _sock, tcp = _parse_unit(value, day_unit, records, day_origins)
+    assert tcp is not None and len(tcp.receiver_intervals) == capture_seconds
+    origin = _iperf_receiver_origin(tcp, verified_origins=day_origins)
+    assert origin is not None
+    support = sorted((left, right) for tool, left, right in day_windows if tool == "iperf3")
+    support_count = sum(any(left <= origin[0] + interval.start_seconds - origin[1]
+        and origin[0] + interval.end_seconds + origin[1] <= right for left, right in support)
+        for interval in tcp.receiver_intervals)
+    selected_whole = [interval for interval in tcp.receiver_intervals
+        if any(left <= origin[0] + interval.start_seconds - origin[1]
+            and origin[0] + interval.end_seconds + origin[1] <= right for left, right in support)
+        and _receiver_interval_bin(origin[0] + interval.start_seconds,
+            origin[0] + interval.end_seconds, day_timing.measured_started_at.value.timestamp(),
+            60, origin[1])[0] is not None]
+    expected_bytes = sum(interval.bytes for interval in selected_whole)
+    expected_seconds = sum(interval.seconds for interval in selected_whole)
+    snapshot = GitSnapshot(commit=StringEvidence(value="a" * 40), dirty=Evidence(value=False),
+        diff_sha256=StringEvidence(value="b" * 64))
+    report = analyze_selection(selection, analysis_git=snapshot).payload
+    assert report["runs"] and report["runs"][0]["current_data_validity"] in {"partial", "invalid"}
+    receiver_rows = [row for row in report["bins"]
+        if row.get("receiver_whole_intervals", {}).get("received_bytes", {}).get("value") is not None]
+    actual_bytes = sum(row["receiver_whole_intervals"]["received_bytes"]["value"] for row in receiver_rows)
+    actual_seconds = sum(row["receiver_whole_intervals"]["measured_seconds"]["value"] for row in receiver_rows)
+    assert receiver_rows and all(row.get("source_refs") for row in receiver_rows)
+    assert (actual_bytes, actual_seconds) == (expected_bytes, expected_seconds)
+    assert support_count == 21_598 and actual_seconds == 20_880
+    assert support_count - len(selected_whole) == 718
+    assert any(row.get("receiver", {}).get("throughput_gbps", {}).get("unavailable_reason")
+        == "receiver interval straddles a bin boundary" for row in report["bins"])
+    assert result.metrics.value["execution"]["bundle_complete"] is False
+    assert all(row["current_data_validity"] in {"partial", "invalid"} for row in report["runs"])
+
+
+def test_magic_incomplete_tail_text_does_not_make_generic_receiver_error_nonfatal(
+        repository_root, tmp_path, frozen_clock, deterministic_token, fake_git_commits,
+        request, monkeypatch):
+    from tests.f12_support import materialize_f08_pair
+    import cloud_network_benchmark.acquisition as acquisition
+    from cloud_network_benchmark.validation import _acquisition_windows
+
+    value, _result, _selection = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request, mode="short_study")
+    timing = next(item for item in value.timings
+        if any(source.tool == "iperf3" for source in item.acquisition_sources.value))
+    original = acquisition.iter_source_windows
+
+    def duplicate_magic_key_error(*args, **kwargs):
+        source = args[1]
+        if source.tool == "iperf3":
+            raise ValueError("duplicate JSON object key 'IncompleteAcquisitionTail:'")
+        yield from original(*args, **kwargs)
+
+    monkeypatch.setattr(acquisition, "iter_source_windows", duplicate_magic_key_error)
+    origins = {}
+    _windows, errors = _acquisition_windows(value, timing, verified_iperf_origins=origins)
+    assert not origins
+    assert any("ValueError" in error and "IncompleteAcquisitionTail:" in error for error in errors)
+
+
 def test_analyze_cli_structural_error_returns_two_and_keeps_legacy_cli(repository_root, tmp_path, capsys):
     bad = tmp_path / "selection.json"
     bad.write_text(json.dumps({"format_version": 1, "runs": []}), encoding="utf-8")

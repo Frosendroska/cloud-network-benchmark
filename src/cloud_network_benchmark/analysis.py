@@ -627,7 +627,10 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         windows, errors = _acquisition_windows(value, timing,
             verified_iperf_origins=unit_origins)
         acquisition[timing.unit_id] = (windows, errors)
-        origins_by_unit[timing.unit_id] = unit_origins if not errors else {}
+        # _acquisition_windows publishes origins only after their receiver
+        # source, session and clock evidence has been verified. A later
+        # recognized incomplete tail does not invalidate that closed prefix.
+        origins_by_unit[timing.unit_id] = unit_origins
     run_rows: list[dict[str, Any]] = []
     bins: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
@@ -696,10 +699,10 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         selected_samples = tuple(sample for _, sample, _ in timed_samples)
         unit_id = unit.unit_id
         windows = acquisition.get(unit_id, ([], []))[0]
-        receiver_windows = _union_intervals((left, right) for tool, left, right in windows if tool == "iperf3")
-        receiver_window_starts = [left for left, _right in receiver_windows]
         receiver_origin = _iperf_receiver_origin(tcp, verified_origins=verified_origins)
         receiver_uncertainty = receiver_origin[1] if receiver_origin is not None else None
+        receiver_windows = _union_intervals((left, right) for tool, left, right in windows if tool == "iperf3")
+        receiver_window_starts = [left for left, _right in receiver_windows]
         receiver_intervals = tuple(tcp.receiver_intervals) if tcp else ()
         selected_receiver = [] if utc_window is not None else list(receiver_intervals)
         mapped_receiver: list[tuple[float, float, Any]] = []

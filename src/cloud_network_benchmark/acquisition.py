@@ -22,6 +22,10 @@ MAX_RECORD_BYTES = 4096
 PREFIX = b"CNB_ACQ_V1 "
 
 
+class IncompleteAcquisitionTail(ValueError):
+    """A verified source prefix ended at an explicitly incomplete terminal tail."""
+
+
 def _canonical_version_text(value: str) -> str:
     """Match bootstrap's full-banner representation; remove only framing whitespace."""
     return value.strip()
@@ -261,9 +265,9 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     if interval_count == 0:
         raise ValueError("iperf receiver interval evidence is missing")
     if native is not None and native.get("receiver_complete") is not True:
-        raise ValueError("native iperf receiver JSONL has an unknown session tail")
+        raise IncompleteAcquisitionTail("native iperf receiver JSONL has an unknown session tail")
     if native is not None and native.get("native_tail"):
-        raise ValueError("native iperf receiver JSONL has an unknown truncated tail")
+        raise IncompleteAcquisitionTail("native iperf receiver JSONL has an unknown truncated tail")
     if native is not None and native.get("filtered_tail"):
         filtered = native["filtered_tail"]
         bounds = ", ".join(f"stream {stream} [{item['start_us']}, {item['end_us']}) us "
@@ -271,9 +275,9 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         raise ValueError("native iperf reporter filtered the final all-stream zero-byte interval(s) "
             f"({bounds}); duration remains unsupported")
     if native is not None and native.get("client_tail"):
-        raise ValueError("A-side diagnostic iperf client JSONL has an unknown truncated final event")
+        raise IncompleteAcquisitionTail("A-side diagnostic iperf client JSONL has an unknown truncated final event")
     if native is not None and native.get("client_complete") is not True:
-        raise ValueError("A-side iperf client JSONL ended without a complete end event")
+        raise IncompleteAcquisitionTail("A-side iperf client JSONL ended without a complete end event")
 
 
 def _validate_anchor(record: ParsedRecord, source: AcquisitionSource) -> None:
@@ -730,7 +734,8 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
         _preflight_iperf_source(iperf_records, source, native_metadata, outcome)
     yield from _iperf_windows(iperf_records(), source, native_metadata)
     if outcome not in {None, "succeeded"}:
-        raise ValueError(f"acquisition producer command outcome {outcome!r} leaves an unknown tail")
+        raise IncompleteAcquisitionTail(
+            f"acquisition producer command outcome {outcome!r} leaves an unknown tail")
 
 
 def bind_acquisition_sources(*, child_root: Path, run_identity: object, commands: Sequence[CommandEvidence],

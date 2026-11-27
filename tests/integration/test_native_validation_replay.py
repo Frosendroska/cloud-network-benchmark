@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from types import GeneratorType
@@ -18,7 +19,7 @@ from cloud_network_benchmark.contracts import (
     VmMetadata, artifact_inputs,
 )
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
-from cloud_network_benchmark.contracts.common import CleanupState, ExecutionState
+from cloud_network_benchmark.contracts.common import CleanupState, ExecutionState, FailureEvidence
 from cloud_network_benchmark.validation import evaluate_comparison, validate_bundle
 from cloud_network_benchmark.summaries import summarize_validation
 
@@ -74,7 +75,8 @@ def test_materialized_jsonl_records_are_consumed_incrementally(tmp_path):
 
 def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, deterministic_token,
                                 fake_git_commits, request, *, config_name="exp-001-multi-provider.yaml",
-                                mode_override=None, provider="aws", frozen_n=False, shared_slot=False):
+                                mode_override=None, provider="aws", frozen_n=False, shared_slot=False,
+                                day_capture_seconds=None):
     from tests.unit.test_validation import NOW, make_input
 
     config_folder = "tests" if mode_override == "acceptance" else "experiments"
@@ -120,9 +122,10 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
               _build("iperf3", VmRole.VM_B, "f08-vmb-iperf3-build")]
     if value.mode=="diagnostic_day":
         day_id=units[0].unit_id
+        chunk_count = math.ceil(day_capture_seconds / 300) if day_capture_seconds is not None else 288
         units.extend(PhaseConfiguration(unit_id=f"probe-chunk-{index:06d}",kind="probe_chunk",
             phase="multi_flow",measured_seconds=300,parent_unit_id=day_id)
-            for index in range(1,289))
+            for index in range(1,chunk_count + 1))
     declarations = artifact_inputs(ArtifactLayout.for_mode(value.mode, units), mode=value.mode,
         measurement_units=units,schedule_supplied=True)
     records, commands, timings, samples = [], [], [], []
@@ -211,7 +214,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         measured_offset = 5 if idle_phase else (7 if day_unit else 0 if chunk_unit else 7)
         measured_start = probe_start + timedelta(seconds=measured_offset)
         duration=unit.measured_seconds
-        measured_finish = measured_start + timedelta(seconds=duration)
+        actual_duration = min(duration, day_capture_seconds) if day_unit and day_capture_seconds is not None else duration
+        measured_finish = measured_start + timedelta(seconds=actual_duration)
         tcp_start = Evidence[datetime](unavailable_reason="idle phase has no TCP client") if idle_phase or chunk_unit else Evidence[datetime](value=probe_start+timedelta(seconds=2))
         mapping_a = ClockMapping(vm_role="vm_a", monotonic_seconds=0, utc_timestamp=NOW,
             estimated_error_ms={"value":0}, synchronization_source={"value":"synthetic clock fixture"})
@@ -220,8 +224,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         timing = MeasurementTiming(unit_id=unit.unit_id, deployment_id=deployment_id,
             probe_test_started_at={"value":probe_start}, tcp_started_at=tcp_start,
             measured_started_at={"value":measured_start}, measured_finished_at={"value":measured_finish},
-            monotonic_started={"value":float(start_offset+1)}, monotonic_finished={"value":float(start_offset+measured_offset+duration+1)},
-            omitted_seconds=float(measured_offset), overlap_seconds={"value":duration},
+            monotonic_started={"value":float(start_offset+1)}, monotonic_finished={"value":float(start_offset+measured_offset+actual_duration+1)},
+            omitted_seconds=float(measured_offset), overlap_seconds={"value":actual_duration},
             clock_mappings=[mapping_a, mapping_b] if not idle_phase else [mapping_a])
         timings.append(timing)
         if not day_unit and not chunk_unit:
@@ -246,6 +250,12 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 "result":{**commands[-1].result,"action_id":day_action},
                 "binary_version":Evidence[str](value=day_build.binary_version),
                 "source_identity":Evidence[str](value=day_build.source_reference)})
+            if day_capture_seconds is not None:
+                client_finish = NOW + timedelta(seconds=start_offset + 2 + 5 + day_capture_seconds)
+                commands[-1] = commands[-1].model_copy(update={
+                    "result":{**commands[-1].result,"outcome":"failed"},
+                    "monotonic_finished":Evidence[float](value=float(start_offset + 2 + 5 + day_capture_seconds)),
+                    "finished_at":Evidence[datetime](value=client_finish)})
         if chunk_unit:
             chunk_index=index-1
             start_offset=chunk_index*300
@@ -363,12 +373,15 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             start_data={"cookie":cookie,"test_start":settings,"connected":connected,
                 "timestamp":{"timesecs":stamp}}
             start_event={"event":"start","data":start_data}
+            capture_duration = day_capture_seconds if day_capture_seconds is not None else 86400
             interval_events=({"event":"interval","data":{"streams":[{"socket":17,
                 "start":second,"end":second+1,"seconds":1,"bytes":125000000,"omitted":False,"sender":False}]}}
-                for second in range(86400))
+                for second in range(capture_duration))
             end_event={"event":"end","data":{"sum_received":{"bytes":10800000000000,"seconds":86400}}}
-            client_payload="\n".join(json.dumps(item,separators=(",",":"))
-                for item in (start_event,*interval_events,end_event))+"\n"
+            client_events=[start_event,*interval_events]
+            if day_capture_seconds is None:
+                client_events.append(end_event)
+            client_payload="\n".join(json.dumps(item,separators=(",",":")) for item in client_events)+"\n"
             materialize("day-iperf3-client",unit.unit_id,client_payload)
             materialize("day-iperf3-observation",unit.unit_id,
                 "day client process stdout/stderr closure evidence is retained separately\n")
@@ -381,7 +394,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"session_settings","cookie":cookie,"protocol":"TCP","num_streams":1,"omit":5,"duration":86400,"interval_us":1000000,"block_size":131072,"reverse":False},
                 {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"initial","origin_us":mono_initial//1000,"start_time_fixed_us":mono_initial//1000},
                 {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"post_omit","origin_us":mono_post//1000,"start_time_fixed_us":mono_initial//1000}]
-            for second in range(86400):
+            capture_duration = day_capture_seconds if day_capture_seconds is not None else 86400
+            for second in range(capture_duration):
                 source_rows.append({"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":"17","role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":"5201","remote_host":"10.0.0.1","remote_port":"50100","interval_start_us":mono_post//1000+second*1000000,"interval_end_us":mono_post//1000+(second+1)*1000000,"bytes":125000000,"omitted":False})
             materialize("iperf3_server_error",None,
                 b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":" )).encode()+b"\n" for row in source_rows))
@@ -411,6 +425,17 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         if receiver_source_rows:
             materialize("iperf3_server_error",None,
                 b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":")).encode()+b"\n" for row in receiver_source_rows))
+    if value.mode == "diagnostic_day" and day_capture_seconds is not None:
+        # systemd-run records successful receiver-service launch, not its later
+        # lifetime; the closed prefix is evidenced by the materialized streams.
+        commands[-1] = commands[-1].model_copy(update={
+            "monotonic_finished":Evidence[float](value=1.0),
+            "finished_at":Evidence[datetime](value=NOW+timedelta(seconds=1))})
+        # The foreground Sockperf listener remains active until the one cleanup
+        # action closes the interrupted capture's retained deployment.
+        commands[-2] = commands[-2].model_copy(update={
+            "monotonic_finished":Evidence[float](value=float(8 + day_capture_seconds)),
+            "finished_at":Evidence[datetime](value=NOW+timedelta(seconds=8 + day_capture_seconds))})
     for unit in units:
         if unit.kind!="probe_chunk":
             materialize(f"{unit.unit_id}-commands",unit.unit_id,json.dumps(
@@ -432,7 +457,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         # CNB acquisition rows above; it is not the session-start timestamp.
         stamp=(NOW+timedelta(seconds=offset+2)).timestamp()
         received_bytes=10800000000000 if value.mode=="diagnostic_day" else 125000000
-        receiver_seconds=86400 if value.mode=="diagnostic_day" else unit.measured_seconds
+        receiver_seconds=(day_capture_seconds if day_capture_seconds is not None else 86400) if value.mode=="diagnostic_day" else unit.measured_seconds
         # Receiver interval offsets are relative to the independently captured
         # post-omit stats origin, so the first measured interval begins at 0.
         interval_start=0
@@ -453,11 +478,12 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         if value.mode == "diagnostic_day":
             receiver_events.extend({"event":"interval","data":{"streams":[{"socket":17,
                 "start":second,"end":second+1,"seconds":1,"bytes":125000000,"sender":False,"omitted":False}]}}
-                for second in range(86_400))
+                for second in range(receiver_seconds))
         else:
             receiver_events.append({"event":"interval","data":{"sum":{"start":interval_start,"end":interval_start+receiver_seconds,
                 "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
-        receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
+        if day_capture_seconds is None:
+            receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
     materialize("iperf3_server_log",None,"\n".join(json.dumps(event) for event in receiver_events)+"\n")
     from cloud_network_benchmark.acquisition import bind_acquisition_sources
     receiver_command=commands[-1]
@@ -484,10 +510,19 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             records[records.index(timing_record)]=timing_record.model_copy(update={
                 "size_bytes":Evidence[int](value=len(raw)),"sha256":StringEvidence(value=hashlib.sha256(raw).hexdigest())})
     # The clock records above use the same monotonic epoch as the frozen UTC mappings.
-    for offset, state in enumerate(("provision_ready","running","collecting","validating","succeeded")):
+    capture_failure = (FailureEvidence(category="measurement_interrupted",
+        message="synthetic DAY capture stopped at the configured six-hour fixture cutoff",
+        occurred_at=NOW+timedelta(seconds=7 + day_capture_seconds), action_id="iperf3-diagnostic-day")
+        if day_capture_seconds is not None else None)
+    states = (("provision_ready","running","collecting") if capture_failure else
+        ("provision_ready","running","collecting","validating","succeeded"))
+    for offset, state in enumerate(states):
         update_child_execution(child_path,state,NOW+timedelta(seconds=offset+1))
-    update_child_cleanup(child_path,"attempted",NOW+timedelta(seconds=7))
-    update_child_cleanup(child_path,"succeeded",NOW+timedelta(seconds=8))
+    if capture_failure is not None:
+        update_child_execution(child_path,"failed",capture_failure.occurred_at,failure=capture_failure)
+    cleanup_start = NOW+timedelta(seconds=7 + (day_capture_seconds or 0))
+    update_child_cleanup(child_path,"attempted",cleanup_start)
+    update_child_cleanup(child_path,"succeeded",cleanup_start+timedelta(seconds=1))
     child=json.loads(child_path.read_text())
     tool_versions=StructuredEvidence(value=child["tool_versions"]["value"])
     provider_metadata=StructuredEvidence(value={"region":"us-east-1","zone":"us-east-1a"})
@@ -501,10 +536,9 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "commands":[item.model_dump(mode="json") for item in manifest_commands],
         "timings":[item.model_dump(mode="json") for item in manifest_timings],
         "artifact_records":[item.model_dump(mode="json") for item in manifest_records],
-        "execution_state":"succeeded","cleanup_state":"succeeded",
+        "execution_state":"failed" if capture_failure else "succeeded","cleanup_state":"succeeded",
         "vm_metadata":vm_metadata.model_dump(mode="json"),"provider_metadata":provider_metadata.model_dump(mode="json"),
-        "tool_versions":tool_versions.model_dump(mode="json"),
-        "actual_started_at":NOW.isoformat(),"actual_finished_at":(NOW+timedelta(seconds=1)).isoformat()})
+        "tool_versions":tool_versions.model_dump(mode="json")})
     child_path.write_text(json.dumps(child,sort_keys=True))
     resolved_sha=hashlib.sha256(resolved_bytes).hexdigest()
     git=child["config_provenance"]
@@ -513,6 +547,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "config_snapshot_path":"config.yaml","resolved_snapshot_path":"config.resolved.json",
         "config_sha256":hashlib.sha256(config_bytes).hexdigest(),"resolved_sha256":Evidence[str](value=resolved_sha),
         "measurement_units":units,"artifacts":declarations,"artifact_records":records,"commands":commands,"timings":timings,
+        "execution_state":ExecutionState.FAILED if capture_failure else ExecutionState.SUCCEEDED,
+        "cleanup_state":CleanupState.SUCCEEDED,"failure":capture_failure,
         "vm_metadata_records":metadata,"vm_metadata":vm_metadata,"provider_metadata":provider_metadata,
         "tool_versions":tool_versions,"implementation_git_commit":StringEvidence(value=git["implementation_git_commit"]["value"]),
         "design_git_commit":StringEvidence(value=git["design_git_commit"]["value"]),
@@ -523,7 +559,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "schedule_snapshot_path":Evidence[str](value="schedule.csv"),"diagnostics":diagnostics})
     before={record.path:hashlib.sha256((child_root/record.path).read_bytes()).hexdigest() for record in records}
     result=validate_bundle(complete,evaluated_at=NOW)
-    expected_validity="partial" if value.mode=="short_study" and not frozen_n else "valid"
+    expected_validity=("partial" if value.mode=="short_study" and not frozen_n else
+        "invalid" if capture_failure is not None else "valid")
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.artifact_id,item.message) for item in result.findings]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     summary=summarize_validation(result)

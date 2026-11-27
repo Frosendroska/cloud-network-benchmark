@@ -1116,3 +1116,29 @@ def test_sequence_requires_actual_sockperf_runtime_and_ten_second_pause(reposito
     value = value.model_copy(update={"timings":[value.timings[0], too_early, *value.timings[2:]]})
     findings = _sequence_timing_findings(value, {first.unit_id:NativeParse(probe_counts=(counts,))})
     assert any(item.code == "timing.phase_pause" and item.unit_id == second.unit_id for item in findings)
+
+
+def test_iperf_support_coalesces_only_raw_exact_same_identity_rows():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    from cloud_network_benchmark.validation import _coalesce_iperf_source_windows
+
+    def row(start, end, *, cookie="session", boot="boot", clock="CLOCK_MONOTONIC",
+            stream="17", omitted=False):
+        return SourceWindow("receiver_measured", "iperf3", "vm_b", boot, clock, cookie, stream,
+            start, start + 1000, end, end + 1000, omitted, start // 1000, 100)
+
+    mapping = (0, "vm_b", "2026-10-21T00:00:00+00:00", 0.0, 1.0)
+    merged = list(_coalesce_iperf_source_windows([
+        row(0, 1_000_000), row(1_000_000, 2_000_000),
+        row(2_001_000, 3_000_000),  # a real one-microsecond raw gap
+        row(3_000_000, 4_000_000, cookie="other-session"),
+        row(4_000_000, 5_000_000, boot="other-boot"),
+        row(5_000_000, 6_000_000, clock="CLOCK_MONOTONIC_RAW"),
+        row(6_000_000, 7_000_000, stream="18"),
+        row(7_000_000, 8_000_000, omitted=True),
+    ], mapping))
+
+    assert [(item.start_earliest_ns, item.end_earliest_ns) for item in merged] == [
+        (0, 2_000_000), (2_001_000, 3_000_000), (3_000_000, 4_000_000),
+        (4_000_000, 5_000_000), (5_000_000, 6_000_000),
+        (6_000_000, 7_000_000), (7_000_000, 8_000_000)]

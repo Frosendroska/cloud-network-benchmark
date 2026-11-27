@@ -27,6 +27,40 @@ from .manifests import CampaignManifest, ChildRunManifest
 from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
 
 
+def _coalesce_iperf_source_windows(windows: Any, mapping_identity: tuple[Any, ...]):
+    """Join only raw-exact adjacent rows with identical receiver provenance."""
+    from .acquisition import IncompleteAcquisitionTail
+
+    pending: dict[tuple[Any, ...], Any] = {}
+
+    def flush():
+        nonlocal pending
+        values = tuple(pending.values())
+        pending = {}
+        return values
+
+    try:
+        for candidate in windows:
+            if candidate.tool != "iperf3":
+                yield candidate
+                continue
+            key = (candidate.tool, candidate.producer, candidate.boot_id,
+                candidate.clock_domain, candidate.session_id, candidate.stream_id,
+                candidate.omitted, mapping_identity)
+            previous = pending.get(key)
+            if previous is not None and previous.end_earliest_ns == candidate.start_earliest_ns:
+                pending[key] = replace(previous, end_earliest_ns=candidate.end_earliest_ns,
+                    end_latest_ns=candidate.end_latest_ns)
+            else:
+                if previous is not None:
+                    yield previous
+                pending[key] = candidate
+    except IncompleteAcquisitionTail:
+        yield from flush()
+        raise
+    yield from flush()
+
+
 def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                          verified_iperf_origins: dict[str, dict[str, Any]] | None = None
                          ) -> tuple[list[Any], list[str]]:
@@ -34,13 +68,17 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
     sources = timing.acquisition_sources.value
     if not sources:
         return [], []
-    from .acquisition import iter_source_windows
+    from .acquisition import IncompleteAcquisitionTail, iter_source_windows
     from .bootstrap import BuildObservation
 
     root = Path(value.child_result_root)
     windows: list[tuple[str, float, float]] = []
     errors: list[str] = []
+    fatal_iperf_origin = False
     for source in sources:
+        source_windows: list[tuple[str, float, float]] = []
+        source_origins: dict[str, dict[str, Any]] = {}
+        terminal_error: str | None = None
         referenced = {source.log_artifact_id, source.build_artifact_id, *source.native_artifact_ids}
         candidates = [record for record in value.artifact_records if record.artifact_id in referenced]
         # Day layouts reuse declaration IDs for chunk paths. Narrow each helper
@@ -85,12 +123,21 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 raise ValueError("source clock domain lacks one bounded clock mapping")
             mapping = mappings[0]
             uncertainty = mapping.estimated_error_ms.value / 1000
-            replayed_windows = list(iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings))
-            for window in replayed_windows:
-                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
-                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
-                if window.has_positive_inner_support and end > start:
-                    windows.append((source.tool, start, end))
+            mapping_identity = (tuple(mapping_indexes), str(getattr(mapping.vm_role, "value", mapping.vm_role)),
+                mapping.utc_timestamp.isoformat(), mapping.monotonic_seconds, mapping.estimated_error_ms.value)
+
+            try:
+                source_windows_iter = iter_source_windows(root, source, candidates, value.commands,
+                    [build], timing.clock_mappings)
+                window_iter = (_coalesce_iperf_source_windows(source_windows_iter, mapping_identity)
+                    if source.tool == "iperf3" else source_windows_iter)
+                for window in window_iter:
+                    start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
+                    end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
+                    if window.has_positive_inner_support and end > start:
+                        source_windows.append((source.tool, start, end))
+            except IncompleteAcquisitionTail as exc:
+                terminal_error = f"{type(exc).__name__}: {exc}"
             if source.tool == "iperf3" and verified_iperf_origins is not None:
                 origin_record = next((item for item in candidates
                     if item.artifact_id == source.log_artifact_id and item.path == source.log_path), None)
@@ -158,9 +205,19 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                     "crossing_reset": crossing, "stream_count": len(by_stream)}
                 if previous_origin is not None and previous_origin != observed:
                     raise ValueError("receiver cookie has contradictory verified post-omit origins")
-                verified_iperf_origins[source.session_id] = observed
+                source_origins[source.session_id] = observed
+            windows.extend(source_windows)
+            if verified_iperf_origins is not None:
+                verified_iperf_origins.update(source_origins)
+            if terminal_error:
+                errors.append(f"{source.tool} acquisition replay failed: {terminal_error}")
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
             errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
+            fatal_iperf_origin = fatal_iperf_origin or source.tool == "iperf3"
+    if verified_iperf_origins is not None and fatal_iperf_origin:
+        # A later fatal receiver-source contradiction invalidates publication
+        # for the timing as a whole; the explicitly typed terminal tail does not.
+        verified_iperf_origins.clear()
     return windows, errors
 
 
