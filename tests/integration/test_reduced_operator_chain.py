@@ -93,26 +93,10 @@ class _ActualCliPopenBoundary:
             self.stderr_router.local.target = captured
             try:
                 if module == "cloud_network_benchmark":
-                    from cloud_network_benchmark import lifecycle_cli
-                    lifecycle_main = lifecycle_cli.main
+                    from cloud_network_benchmark.lifecycle_cli import main as lifecycle_main
                     if arguments[:1] != ["lifecycle"]:
                         raise AssertionError(f"unexpected top-level CLI subcommand: {arguments!r}")
-                    production_datetime = lifecycle_cli.datetime
-                    run_clock = self.run_clock
-
-                    class ClockBoundDateTime(production_datetime):
-                        @classmethod
-                        def now(cls, tz=None):
-                            value = run_clock.utc_now()
-                            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
-
-                    # Bind CLI preview/default wall-time reads to the same
-                    # synthetic clock as actual lifecycle execution.
-                    lifecycle_cli.datetime = ClockBoundDateTime
-                    try:
-                        process.returncode = lifecycle_main(arguments[1:], run_clock=run_clock)
-                    finally:
-                        lifecycle_cli.datetime = production_datetime
+                    process.returncode = lifecycle_main(arguments[1:], run_clock=self.run_clock)
                 else:
                     from cloud_network_benchmark.campaign_supervisor import main as supervisor_main
                     from cloud_network_benchmark import campaign as campaign_module
