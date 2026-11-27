@@ -211,17 +211,25 @@ def test_magic_incomplete_tail_text_does_not_make_generic_receiver_error_nonfata
         deterministic_token, fake_git_commits, request, mode="short_study")
     timing = next(item for item in value.timings
         if any(source.tool == "iperf3" for source in item.acquisition_sources.value))
+    receiver_source = next(source for source in timing.acquisition_sources.value if source.tool == "iperf3")
+    timing = timing.model_copy(update={"acquisition_sources":
+        timing.acquisition_sources.model_copy(update={"value": [receiver_source, receiver_source]})})
     original = acquisition.iter_source_windows
+    receiver_calls = 0
 
     def duplicate_magic_key_error(*args, **kwargs):
+        nonlocal receiver_calls
         source = args[1]
         if source.tool == "iperf3":
-            raise ValueError("duplicate JSON object key 'IncompleteAcquisitionTail:'")
+            receiver_calls += 1
+            if receiver_calls == 2:
+                raise ValueError("duplicate JSON object key 'IncompleteAcquisitionTail:'")
         yield from original(*args, **kwargs)
 
     monkeypatch.setattr(acquisition, "iter_source_windows", duplicate_magic_key_error)
     origins = {}
     _windows, errors = _acquisition_windows(value, timing, verified_iperf_origins=origins)
+    assert receiver_calls == 2
     assert not origins
     assert any("ValueError" in error and "IncompleteAcquisitionTail:" in error for error in errors)
 
