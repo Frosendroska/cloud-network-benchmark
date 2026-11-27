@@ -136,7 +136,11 @@ def replay_and_reconcile_actual_capsule(*, capsule_path: Path, expected_capsule_
             try:
                 campaign_driver.reconcile_archive(state_root, stage_id, entry_id, receipt_path)
             except ValueError as exc:
-                if "capsule identity fields" not in str(exc):
+                expected_identity_rejections = (
+                    "capsule identity fields",
+                    "run_id must match campaign_id and provider",
+                )
+                if not any(reason in str(exc) for reason in expected_identity_rejections):
                     raise
             else:
                 raise ValueError("tampered first-provider child identity was accepted")
