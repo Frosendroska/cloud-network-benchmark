@@ -93,10 +93,26 @@ class _ActualCliPopenBoundary:
             self.stderr_router.local.target = captured
             try:
                 if module == "cloud_network_benchmark":
-                    from cloud_network_benchmark.lifecycle_cli import main as lifecycle_main
+                    from cloud_network_benchmark import lifecycle_cli
+                    lifecycle_main = lifecycle_cli.main
                     if arguments[:1] != ["lifecycle"]:
                         raise AssertionError(f"unexpected top-level CLI subcommand: {arguments!r}")
-                    process.returncode = lifecycle_main(arguments[1:], run_clock=self.run_clock)
+                    production_datetime = lifecycle_cli.datetime
+                    run_clock = self.run_clock
+
+                    class ClockBoundDateTime(production_datetime):
+                        @classmethod
+                        def now(cls, tz=None):
+                            value = run_clock.utc_now()
+                            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+                    # Bind CLI preview/default wall-time reads to the same
+                    # synthetic clock as actual lifecycle execution.
+                    lifecycle_cli.datetime = ClockBoundDateTime
+                    try:
+                        process.returncode = lifecycle_main(arguments[1:], run_clock=run_clock)
+                    finally:
+                        lifecycle_cli.datetime = production_datetime
                 else:
                     from cloud_network_benchmark.campaign_supervisor import main as supervisor_main
                     from cloud_network_benchmark import campaign as campaign_module
@@ -504,6 +520,15 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
             value = now if tz is not None else now.replace(tzinfo=None)
             return value.astimezone(tz) if tz is not None else value
     monkeypatch.setattr(campaign_inputs, "datetime", FrozenDateTime)
+    production_initializer = campaign_inputs.initialize_campaign
+
+    def initialize_at_synthetic_epoch(*args, **kwargs):
+        # initialize_campaign binds utc_now as its default at import time, so
+        # pass the test epoch explicitly before prepared or CLI work begins.
+        kwargs.setdefault("clock", lambda: now)
+        return production_initializer(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_inputs, "initialize_campaign", initialize_at_synthetic_epoch)
     lower = (now - timedelta(minutes=1)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (now + timedelta(hours=5)).isoformat()}
