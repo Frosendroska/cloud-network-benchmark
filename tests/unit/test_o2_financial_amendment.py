@@ -237,6 +237,29 @@ def _private_o4_retry_cap_removal_source():
     return source
 
 
+def _private_o9_sources():
+    import os
+    from pathlib import Path
+    base = Path("/private/tmp/cnb-o9-authority-inputs-20261127")
+    resume = Path(os.environ.get("CNB_O9_RESUME_SOURCE_PATH",
+        base / "genuine-human-resume-instruction-01.json"))
+    budget = Path(os.environ.get("CNB_O9_BUDGET_AMENDMENT_SOURCE_PATH",
+        base / "genuine-human-budget-amendment-O9-EUR500-01.json"))
+    timing = Path(os.environ.get("CNB_O9_TIMING_PROPOSAL_SOURCE_PATH",
+        base / "derived-bounded-timing-proposal-O9-01.json"))
+    if not resume.is_file() or not budget.is_file() or not timing.is_file():
+        pytest.skip("private, byte-verified O9 objective, budget and timing sources are not available")
+    expected = {
+        resume: fc._O9_RESUME_SOURCE_SHA256,
+        budget: fc._O9_BUDGET_AMENDMENT_SHA256,
+        timing: fc._O9_TIMING_PROPOSAL_SHA256,
+    }
+    for path, digest in expected.items():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            pytest.fail("private O9 source bytes differ from production pins")
+    return resume, budget, timing
+
+
 def _o3_test_card(tmp_path, monkeypatch):
     import hashlib
     import json
@@ -583,4 +606,142 @@ def test_o4_source_does_not_expand_existing_card_limits(
     path.write_text(json.dumps(changed, sort_keys=True) + "\n")
     reference = {"source_path": str(path), "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     with pytest.raises(fc.FinancialError, match=expected):
+        _validate(reference, binding)
+
+
+def _o9_test_card(tmp_path, monkeypatch):
+    import copy
+    from pathlib import Path
+
+    end = datetime(2026, 11, 28, 7, 0, tzinfo=timezone.utc)
+    dispatch_start = datetime(2026, 11, 27, 8, 42, 48, tzinfo=timezone.utc)
+    monkeypatch.setattr(__import__(__name__, fromlist=["POLICY_END"]), "POLICY_END", end)
+    card, _reference, binding = _o3_test_card(tmp_path, monkeypatch)
+    resume_path, budget_path, timing_path = _private_o9_sources()
+    exposure_path = _private_o4_retry_cap_removal_source()
+    card["continuation_resume_source"] = {"path": str(resume_path),
+        "sha256": hashlib.sha256(resume_path.read_bytes()).hexdigest()}
+    card["continuation_budget_amendment"] = {"path": str(budget_path),
+        "sha256": hashlib.sha256(budget_path.read_bytes()).hexdigest()}
+    card["continuation_timing_proposal"] = {"path": str(timing_path),
+        "sha256": hashlib.sha256(timing_path.read_bytes()).hexdigest()}
+    card["continuation_exposure_amendment"] = {"path": str(exposure_path),
+        "sha256": hashlib.sha256(exposure_path.read_bytes()).hexdigest()}
+    card["approved_at"] = "2026-11-27T08:42:49Z"
+    card["valid_from"] = dispatch_start.isoformat()
+    card["valid_until"] = end.isoformat()
+    card["caps"].update(project_eur="500", working_eur="500", protected_eur="0",
+        personal_cash_eur="500", batch_eur="500", stage_eur="16", run_eur="8",
+        providers_eur={provider: "500" for provider in ("aws", "azure", "gcp")})
+    path = tmp_path / "SYNTHETIC-O9-financial-card.json"
+    path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    reference = {"source_path": str(path),
+        "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return copy.deepcopy(card), reference, binding, dispatch_start
+
+
+def test_o9_exact_sources_bind_new_ceiling_and_bounded_window(tmp_path, monkeypatch):
+    from decimal import Decimal
+
+    resume_path, budget_path, timing_path = _private_o9_sources()
+    resume = fc.Source(path=str(resume_path), sha256=fc._O9_RESUME_SOURCE_SHA256)
+    budget = fc.Source(path=str(budget_path), sha256=fc._O9_BUDGET_AMENDMENT_SHA256)
+    timing = fc.Source(path=str(timing_path), sha256=fc._O9_TIMING_PROPOSAL_SHA256)
+    assert fc.validate_o9_resume_source(resume) == resume
+    assert fc.validate_o9_budget_amendment_source(budget) == budget
+    start, dispatch_end, execution_end = fc.validate_o9_timing_proposal_source(
+        timing, budget_amendment=budget, resume_source=resume)
+    assert start == datetime(2026, 11, 27, 8, 42, 48, tzinfo=timezone.utc)
+    assert dispatch_end == datetime(2026, 11, 28, 5, 45, tzinfo=timezone.utc)
+    assert execution_end == datetime(2026, 11, 28, 7, 0, tzinfo=timezone.utc)
+
+    card, reference, binding, _start = _o9_test_card(tmp_path, monkeypatch)
+    now = datetime(2026, 11, 27, 8, 43, tzinfo=timezone.utc)
+    _source, parsed = fc.validate_authority(reference, binding=binding, scope_id=SCOPE,
+        now=now, end=now + timedelta(seconds=4200))
+    assert parsed.caps.project_eur == "500"
+    assert parsed.caps.personal_cash_eur == "500"
+    assert parsed.caps.stage_eur == "16" and parsed.caps.run_eur == "8"
+    assert fc._validate_o3_epoch_allocation(Decimal("64"), Decimal("16"),
+        fc.Source(path=str(_private_o4_retry_cap_removal_source()),
+            sha256=fc._O4_RETRY_CAP_REMOVAL_SHA256)) is None
+
+    import cloud_network_benchmark.campaign_inputs as inputs
+    _resume_path, _budget_path, _timing_path = _private_o9_sources()
+    _continuation_path, _amendment_path, guard_path = _private_o3_sources()
+    settings = {"pricing": {
+        "continuation_authorization": card["continuation_authorization"],
+        "continuation_exposure_amendment": card["continuation_exposure_amendment"],
+        "continuation_resume_source": card["continuation_resume_source"],
+        "continuation_budget_amendment": card["continuation_budget_amendment"],
+        "continuation_timing_proposal": card["continuation_timing_proposal"],
+        "legacy_usd_guard_correction": {"path": str(guard_path),
+            "sha256": hashlib.sha256(guard_path.read_bytes()).hexdigest()}},
+        "ledger": {"scope_id": SCOPE}}
+    _pending, planning = inputs._reserve_release_policy(settings, "acceptance",
+        draft=True, now=now)
+    assert _pending is None and fc.has_o3_continuation_cost_source(planning, now=now)
+    paid_settings = {**settings, "approvals": {"paid_authorization": {
+        "confirmed": True, "source": reference["source_path"],
+        "sha256": reference["source_sha256"]}}}
+    _pending, paid_snapshot = inputs._reserve_release_policy(paid_settings,
+        "acceptance", draft=False, now=now)
+    assert _pending is None and fc._has_source_bound_o3_continuation(paid_snapshot, now=now)
+    assert fc.legacy_usd_budget_exceeded(Decimal("304.2879978288326933322751497"),
+        paid_snapshot, now=now) is False
+    assert fc.has_explicit_eur_reserve_release(paid_snapshot, now=now) is False
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("missing_timing", "financial_amendment_invalid"),
+    ("wrong_budget_source", "financial_amendment_invalid"),
+    ("over_500", "financial_ceiling_exceeded"),
+    ("over_stage", "financial_ceiling_exceeded"),
+    ("over_run", "financial_ceiling_exceeded"),
+    ("new_reserve", "financial_ceiling_exceeded"),
+    ("changed_case", "financial_scope_mismatch"),
+    ("expired_dispatch", "financial_authorization_expired"),
+])
+def test_o9_amendment_does_not_expand_caps_or_change_scope(
+        tmp_path, monkeypatch, mutation, expected):
+    import copy
+
+    card, _reference, binding, _start = _o9_test_card(tmp_path, monkeypatch)
+    changed = copy.deepcopy(card)
+    now = datetime(2026, 11, 27, 8, 43, tzinfo=timezone.utc)
+    if mutation == "missing_timing":
+        changed.pop("continuation_timing_proposal")
+    elif mutation == "wrong_budget_source":
+        changed["continuation_budget_amendment"]["sha256"] = "0" * 64
+    elif mutation == "over_500":
+        changed["caps"].update(project_eur="501", working_eur="501",
+            personal_cash_eur="501")
+    elif mutation == "over_stage":
+        changed["caps"]["stage_eur"] = "17"
+    elif mutation == "over_run":
+        changed["caps"]["run_eur"] = "9"
+    elif mutation == "new_reserve":
+        changed["caps"]["protected_eur"] = "1"
+    elif mutation == "changed_case":
+        changed["entries"][0]["config_id"] = "exp-004-acceptance"
+        binding = changed["entries"][0]
+    elif mutation == "expired_dispatch":
+        now = datetime(2026, 11, 28, 5, 46, tzinfo=timezone.utc)
+    path = tmp_path / f"SYNTHETIC-O9-{mutation}.json"
+    path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+    reference = {"source_path": str(path),
+        "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    with pytest.raises(fc.FinancialError, match=expected):
+        _validate(reference, binding, now=now)
+
+
+def test_legacy_o3_card_keeps_eur400_ceiling_without_o9_amendment(tmp_path, monkeypatch):
+    card, _reference, binding = _o3_test_card(tmp_path, monkeypatch)
+    card["caps"].update(project_eur="401", working_eur="401", personal_cash_eur="401")
+    card["valid_until"] = POLICY_END.isoformat()
+    path = tmp_path / "SYNTHETIC-O3-legacy-400-limit.json"
+    path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    reference = {"source_path": str(path),
+        "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    with pytest.raises(fc.FinancialError, match="financial_ceiling_exceeded"):
         _validate(reference, binding)

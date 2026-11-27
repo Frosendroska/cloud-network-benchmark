@@ -171,6 +171,11 @@ class FinancialAuthorization(StrictModel):
     continuation_authorization: Source | None = None
     # Optional exact human amendment removes only the later EUR48 allocation epoch.
     continuation_exposure_amendment: Source | None = None
+    # Exact O9 source-bound ceiling and timing proposal for a fresh successor.
+    # These never modify a prior card or widen O2/O3 legacy semantics.
+    continuation_resume_source: Source | None = None
+    continuation_budget_amendment: Source | None = None
+    continuation_timing_proposal: Source | None = None
     # No defaults, credit/receipt offsets, or recommendation-derived permission.
     other_gross_eur: str
     other_personal_cash_eur: str
@@ -182,6 +187,9 @@ class FinancialAuthorization(StrictModel):
 _O2_AMENDMENT_SHA256 = '6c2253bfc2e92714289a6932d1e9061f785931b5328e922027122965f58cf0e1'
 _O3_CONTINUATION_SHA256 = '3d30cf5eeb0b59714ffca6fd91cb315e87e9ae68caa232a11282e71d3d9ed49e'
 _O4_RETRY_CAP_REMOVAL_SHA256 = 'd42f4e3c76454e5946f73483d57d37c22a88d90e03595701b03c806c4cadf576'
+_O9_RESUME_SOURCE_SHA256 = 'c57cb62fc9da244d828b0bdc709a3a8676d0b9bc3ad4f1d595ecf086f8800c49'
+_O9_BUDGET_AMENDMENT_SHA256 = '410ce512289aefcd8cb1bf54fa9453d76d726d191937596b9c44e294a5b4dd41'
+_O9_TIMING_PROPOSAL_SHA256 = 'ec371e378160ae644cc6c3eee85166749a7c9bcb0f602b1c92e802ee522949b6'
 _O3_LEGACY_USD_GUARD_CORRECTION_SHA256 = '1d273f0a82aafa5f9aa92a5dd8a021d4a5582fb3963a2b76acadff4e8d9e9228'
 _O3_LEGACY_USD_GUARD_CARD_SHA256 = '7eee878de229e750c1ef239882be72cb6696794bd9dd868580e7590c49b113f2'
 _O3_LEGACY_USD_GUARD_LIMITS = {
@@ -252,16 +260,26 @@ def _validate_o3_continuation(card: FinancialAuthorization, *, now: datetime,
     if ref is None:
         raise FinancialError('financial_amendment_invalid')
     ref = validate_o3_continuation_source(ref, now=now, end=end,
-        existing_authorization=existing_authorization)
+        existing_authorization=existing_authorization,
+        resume_source=card.continuation_resume_source,
+        budget_amendment=card.continuation_budget_amendment,
+        timing_proposal=card.continuation_timing_proposal)
+    if card.continuation_budget_amendment is not None:
+        if card.continuation_exposure_amendment is None:
+            raise FinancialError('financial_amendment_invalid')
     if card.continuation_exposure_amendment is not None:
         validate_o4_retry_cap_removal_source(card.continuation_exposure_amendment)
-    if stamp(card.valid_until) > _O2_POLICY_END:
+    valid_until = stamp(card.valid_until)
+    if card.continuation_timing_proposal is None and valid_until > _O2_POLICY_END:
         raise FinancialError('financial_authorization_expired')
     return ref
 
 
 def validate_o3_continuation_source(ref: Source, *, now: datetime, end: datetime,
-                                    existing_authorization: bool = False) -> Source:
+                                    existing_authorization: bool = False,
+                                    resume_source: Source | None = None,
+                                    budget_amendment: Source | None = None,
+                                    timing_proposal: Source | None = None) -> Source:
     """Validate the exact S1/S3 continuation source during bounded cost planning."""
     if not isinstance(ref, Source) or ref.sha256 != _O3_CONTINUATION_SHA256:
         raise FinancialError('financial_amendment_invalid')
@@ -279,9 +297,23 @@ def validate_o3_continuation_source(ref: Source, *, now: datetime, end: datetime
             or payload.get('scope') != _O3_CONTINUATION_SCOPE):
         raise FinancialError('financial_amendment_invalid')
     now, end = stamp(now), stamp(end)
-    if (now > _O2_POLICY_END or end > _O2_POLICY_END
-            or (not existing_authorization and now > _O2_LATEST_DISPATCH)):
-        raise FinancialError('financial_authorization_expired')
+    o9_refs = (resume_source, budget_amendment, timing_proposal)
+    if all(value is None for value in o9_refs):
+        if (now > _O2_POLICY_END or end > _O2_POLICY_END
+                or (not existing_authorization and now > _O2_LATEST_DISPATCH)):
+            raise FinancialError('financial_authorization_expired')
+    else:
+        if any(value is None for value in o9_refs):
+            raise FinancialError('financial_amendment_invalid')
+        validate_o9_resume_source(resume_source)
+        validate_o9_budget_amendment_source(budget_amendment)
+        dispatch_start, dispatch_end, execution_end = validate_o9_timing_proposal_source(
+            timing_proposal, budget_amendment=budget_amendment,
+            resume_source=resume_source)
+        if (end > execution_end or now > execution_end
+                or (not existing_authorization
+                    and not dispatch_start <= now <= dispatch_end)):
+            raise FinancialError('financial_authorization_expired')
     return ref
 
 
@@ -329,6 +361,122 @@ def validate_o4_retry_cap_removal_source(ref: Source) -> Source:
             or payload.get('source') != 'Direct human user message in this execution chat; exact literal text retained. No stable message UUID is asserted.'):
         raise FinancialError('financial_amendment_invalid')
     return ref
+
+
+def validate_o9_budget_amendment_source(ref: Source) -> Source:
+    """Validate the exact O9 €500 ceiling amendment; it authorizes no dispatch."""
+    if not isinstance(ref, Source) or ref.sha256 != _O9_BUDGET_AMENDMENT_SHA256:
+        raise FinancialError('financial_amendment_invalid')
+    payload = ref.json()
+    if (payload.get('schema_version') != 1
+            or payload.get('kind') != 'genuine-human-total-ceiling-amendment'
+            or payload.get('evidence_id') != 'direct-current-execution-chat-user-increase-total-EUR500-20261127'
+            or payload.get('raw_message_sha256') != '8ce10f95046d418bd20001695a32c6bf7bfc8eca1273299250d773efbc92cee0'
+            or payload.get('prior_budget_source_sha256') != _O2_AMENDMENT_SHA256
+            or payload.get('prior_continuation_source_sha256') != _O3_CONTINUATION_SHA256
+            or payload.get('prior_legacy_guard_source_sha256') != _O3_LEGACY_USD_GUARD_CORRECTION_SHA256
+            or payload.get('prior_retry_cap_removal_sha256') != _O4_RETRY_CAP_REMOVAL_SHA256
+            or payload.get('renewed_objective_source_sha256') != _O9_RESUME_SOURCE_SHA256
+            or payload.get('whole_thesis_ceiling_eur') != '500'
+            or payload.get('cumulative_personal_cash_ceiling_eur') != '500'
+            or payload.get('chair_reimbursement_allowance_eur') != '300'
+            or payload.get('maximum_above_chair_personal_exposure_eur') != '200'
+            or payload.get('reimbursement_above_chair_assumed') is not False
+            or payload.get('new_reserve_release_eur') != '0'
+            or payload.get('batch_cap_eur') != '16'
+            or payload.get('parent_cap_eur') != '8'
+            or payload.get('normal_resource_cap_seconds') != 4200
+            or payload.get('original_review_cap_seconds') != 120
+            or payload.get('same_case_scope') != 'Simultaneous all-cloud S1+S3, two parents/six private provider children, repeated source-bound attempts until genuinely verified, one active batch at a time'
+            or payload.get('scope_increase') is not False
+            or payload.get('all_retained_commitments_and_unknown_bills_preserved') is not True
+            or payload.get('paid_dispatch_from_this_record_alone') is not False
+            or payload.get('reported_billing_observation') != {
+                'amount_upper_bound_exclusive': '2', 'currency': 'EUR',
+                'invoice_finality': 'Unknown', 'is_ledger_reconciliation': False,
+                'period': 'Unknown', 'source': 'same genuine user message'}):
+        raise FinancialError('financial_amendment_invalid')
+    return ref
+
+
+def validate_o9_resume_source(ref: Source) -> Source:
+    """Validate the exact renewed objective; it does not itself grant dispatch or money."""
+    if not isinstance(ref, Source) or ref.sha256 != _O9_RESUME_SOURCE_SHA256:
+        raise FinancialError('financial_amendment_invalid')
+    payload = ref.json()
+    if (payload.get('schema_version') != 1
+            or payload.get('kind') != 'genuine-current-user-continuation-instruction'
+            or payload.get('evidence_id') != 'direct-current-execution-chat-user-resume-S1-S3-20261127'
+            or payload.get('raw_message_sha256') != 'f724af7f27da3590f80028b15b4212c7d7e3598ac246fb92685f2c8047e4ccbd'
+            or payload.get('source_role') != 'user'
+            or payload.get('effective_scope') != 'Resume same S1+S3 end-to-end objective and necessary preparation; standing individual-card delegation preserved'
+            or payload.get('exclusions') != ['CAL', 'DAY', 'WEEK', 'pilots', 'deliberate failure experiments', 'ledger hold reset', 'fabricated billing or passing receipts']
+            or payload.get('expired_price_or_launch_bindings_reused') is not False
+            or payload.get('financial_ceiling_change_inferred') is not False
+            or payload.get('last_explicit_total_ceiling_eur') != '400'
+            or payload.get('batch_cap_eur') != '16'
+            or payload.get('parent_cap_eur') != '8'
+            or payload.get('normal_resource_cap_seconds') != 4200
+            or payload.get('original_review_cap_seconds') != 120
+            or payload.get('new_reserve_release_eur') != '0'
+            or payload.get('paid_dispatch_from_this_record_alone') is not False
+            or payload.get('pending_gate') != 'Explicit numerical ceiling clarification or genuine supported billing reconciliation; then new source/quote/timing bindings'):
+        raise FinancialError('financial_amendment_invalid')
+    return ref
+
+
+def validate_o9_timing_proposal_source(ref: Source, *, budget_amendment: Source,
+                                       resume_source: Source) -> tuple[datetime, datetime, datetime]:
+    """Validate Root's exact bounded timing proposal, not a paid authorization."""
+    if not isinstance(ref, Source) or ref.sha256 != _O9_TIMING_PROPOSAL_SHA256:
+        raise FinancialError('financial_amendment_invalid')
+    validate_o9_budget_amendment_source(budget_amendment)
+    validate_o9_resume_source(resume_source)
+    payload = ref.json()
+    expected_budget = {
+        'path': '/u/halle/brek/home_at/cnb/private/pre-day-release-20261122/fixed-batch-KoPvIO/protected-compact/overnight-acceptance-O9-20261127/genuine-human-budget-amendment-O9-EUR500-01.json',
+        'sha256': _O9_BUDGET_AMENDMENT_SHA256,
+    }
+    expected_resume = {
+        'path': '/u/halle/brek/home_at/cnb/private/pre-day-release-20261122/fixed-batch-KoPvIO/protected-compact/overnight-acceptance-O9-20261127/genuine-human-resume-instruction-01.json',
+        'sha256': _O9_RESUME_SOURCE_SHA256,
+    }
+    if (payload.get('schema_version') != 1
+            or payload.get('kind') != 'root-derived-bounded-timing-proposal'
+            or payload.get('status') != 'PROPOSAL_FOR_SOURCE_BOUND_QUALIFICATION_NOT_DISPATCH'
+            or payload.get('human_budget_source') != expected_budget
+            or payload.get('human_resume_source') != expected_resume
+            or resume_source.sha256 != expected_resume['sha256']
+            or payload.get('actual_price_validity_required') is not True
+            or payload.get('source_qualification_required') is not True
+            or payload.get('fresh_identity_and_readiness_immediately_before_dispatch') is not True
+            or payload.get('paid_authority_from_this_proposal_alone') is not False
+            or payload.get('failed_or_prior_request_deadlines_extended') is not False
+            or payload.get('old_cards_or_pins_modified') is not False
+            or payload.get('one_active_batch') is not True
+            or payload.get('scope_expansion') is not False
+            or payload.get('whole_thesis_and_cash_ceiling_eur') != '500'
+            or payload.get('batch_cap_eur') != '16'
+            or payload.get('parent_cap_eur') != '8'
+            or payload.get('new_reserve_release_eur') != '0'
+            or payload.get('normal_resource_cap_seconds') != 4200
+            or payload.get('original_review_cap_seconds') != 120):
+        raise FinancialError('financial_amendment_invalid')
+    try:
+        derived = stamp(datetime.fromisoformat(payload['derived_at_utc']))
+        dispatch_start = stamp(datetime.fromisoformat(payload['dispatch_window_utc']['not_before_utc']))
+        dispatch_end = stamp(datetime.fromisoformat(payload['dispatch_window_utc']['not_after_utc']))
+        execution_start = stamp(datetime.fromisoformat(payload['execution_window_utc']['not_before_utc']))
+        execution_end = stamp(datetime.fromisoformat(payload['execution_window_utc']['not_after_utc']))
+    except (KeyError, TypeError, ValueError):
+        raise FinancialError('financial_amendment_invalid') from None
+    if (dispatch_start != execution_start or not dispatch_start <= derived < dispatch_start + timedelta(seconds=1)
+            or dispatch_end != stamp(datetime(2026, 11, 28, 5, 45, tzinfo=timezone.utc))
+            or execution_end != stamp(datetime(2026, 11, 28, 7, 0, tzinfo=timezone.utc))
+            or dispatch_end >= execution_end
+            or payload.get('target_price_evidence_horizon_utc') != '2026-11-28T07:00:00Z'):
+        raise FinancialError('financial_amendment_invalid')
+    return dispatch_start, dispatch_end, execution_end
 
 
 def _validate_o3_epoch_allocation(total_including_candidate: Decimal,
@@ -421,24 +569,56 @@ def _validate_o2_amendment(card: FinancialAuthorization, *, now: datetime,
         raise FinancialError('financial_amendment_invalid')
     first_observed = stamp(datetime.fromisoformat(payload['first_observed_at_utc'].replace('Z', '+00:00')))
     now, end = stamp(now), stamp(end)
-    if (first_observed != stamp(datetime.fromisoformat(_O2_FIRST_OBSERVED.replace('Z', '+00:00')))
+    continuation = None
+    if card.continuation_authorization is not None:
+        continuation = _validate_o3_continuation(card, now=now, end=end,
+                                                existing_authorization=existing_authorization)
+    elif (card.continuation_exposure_amendment is not None
+            or card.continuation_resume_source is not None
+            or card.continuation_budget_amendment is not None
+            or card.continuation_timing_proposal is not None):
+        raise FinancialError('financial_amendment_invalid')
+    o9_fields = (card.continuation_resume_source, card.continuation_budget_amendment,
+                 card.continuation_timing_proposal)
+    o9_enabled = any(value is not None for value in o9_fields)
+    if o9_enabled and (continuation is None or any(value is None for value in o9_fields)):
+        raise FinancialError('financial_amendment_invalid')
+    if o9_enabled:
+        budget_ref = card.continuation_budget_amendment
+        timing_ref = card.continuation_timing_proposal
+        resume_ref = card.continuation_resume_source
+        if budget_ref is None or timing_ref is None or resume_ref is None:
+            raise FinancialError('financial_amendment_invalid')
+        validate_o9_budget_amendment_source(budget_ref)
+        dispatch_start, dispatch_end, execution_end = validate_o9_timing_proposal_source(
+            timing_ref, budget_amendment=budget_ref, resume_source=resume_ref)
+        try:
+            budget_payload = budget_ref.json()
+            budget_recorded_at = stamp(datetime.fromisoformat(budget_payload['recorded_at_utc']))
+        except (KeyError, TypeError, ValueError):
+            raise FinancialError('financial_amendment_invalid') from None
+        if (first_observed != stamp(datetime.fromisoformat(_O2_FIRST_OBSERVED.replace('Z', '+00:00')))
+                or first_observed > now or stamp(card.approved_at) < budget_recorded_at
+                or stamp(card.valid_from) < dispatch_start
+                or (not existing_authorization and not dispatch_start <= now <= dispatch_end)
+                or now > execution_end or end > execution_end
+                or stamp(card.valid_until) > execution_end):
+            raise FinancialError('financial_authorization_expired')
+    elif (first_observed != stamp(datetime.fromisoformat(_O2_FIRST_OBSERVED.replace('Z', '+00:00')))
             or first_observed > now
             or (not existing_authorization and now > _O2_LATEST_DISPATCH)
             or now > _O2_POLICY_END or end > _O2_POLICY_END
             or stamp(card.valid_until) > _O2_POLICY_END):
         raise FinancialError('financial_authorization_expired')
-    continuation = None
-    if card.continuation_authorization is not None:
-        continuation = _validate_o3_continuation(card, now=now, end=end,
-                                                existing_authorization=existing_authorization)
-    elif card.continuation_exposure_amendment is not None:
-        raise FinancialError('financial_amendment_invalid')
+    project_limit = Decimal('500') if o9_enabled else Decimal('400')
+    working_limit = Decimal('500') if o9_enabled else (Decimal('400') if continuation else Decimal('302'))
+    batch_limit = Decimal('500') if o9_enabled else (Decimal('400') if continuation else Decimal('233'))
     if (card.approved_at < first_observed
-            or ceiling(card.caps.project_eur) > Decimal('400')
-            or ceiling(card.caps.personal_cash_eur) > Decimal('400')
-            or ceiling(card.caps.working_eur) > (Decimal('400') if continuation else Decimal('302'))
+            or ceiling(card.caps.project_eur) > project_limit
+            or ceiling(card.caps.personal_cash_eur) > project_limit
+            or ceiling(card.caps.working_eur) > working_limit
             or ceiling(card.caps.run_eur) > Decimal('8')
-            or ceiling(card.caps.batch_eur) > (Decimal('400') if continuation else Decimal('233'))
+            or ceiling(card.caps.batch_eur) > batch_limit
             or ceiling(card.caps.stage_eur) > Decimal('16')
             or (continuation is not None and amount(card.caps.protected_eur) != Decimal('0'))):
         raise FinancialError('financial_ceiling_exceeded')
@@ -607,7 +787,11 @@ def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, An
     if card.financial_policy_amendment is not None:
         _validate_o2_amendment(card, now=now, end=end,
                                existing_authorization=existing_authorization)
-    elif card.continuation_authorization is not None:
+    elif (card.continuation_authorization is not None
+            or card.continuation_exposure_amendment is not None
+            or card.continuation_resume_source is not None
+            or card.continuation_budget_amendment is not None
+            or card.continuation_timing_proposal is not None):
         raise FinancialError('financial_amendment_invalid')
     elif ceiling(caps.project_eur) > 300:
         raise FinancialError('financial_ceiling_exceeded')
@@ -683,6 +867,12 @@ def validate_paid_financial_plan(plan: Any, request: Any, *, scope_id: str, now:
             snapshot['continuation_authorization'] = card.continuation_authorization.model_dump()
         if card.continuation_exposure_amendment is not None:
             snapshot['continuation_exposure_amendment'] = card.continuation_exposure_amendment.model_dump()
+        if card.continuation_resume_source is not None:
+            snapshot['continuation_resume_source'] = card.continuation_resume_source.model_dump()
+        if card.continuation_budget_amendment is not None:
+            snapshot['continuation_budget_amendment'] = card.continuation_budget_amendment.model_dump()
+        if card.continuation_timing_proposal is not None:
+            snapshot['continuation_timing_proposal'] = card.continuation_timing_proposal.model_dump()
         if plan.execution_scope == 'paid_request':
             require_transfer_capability(plan.cost_envelopes)
         return snapshot
@@ -733,12 +923,21 @@ def _has_source_bound_o3_continuation(snapshot: Mapping[str, Any] | None, *, now
         amendment = Source.model_validate(snapshot['financial_policy_amendment'])
         exposure_amendment = (Source.model_validate(snapshot['continuation_exposure_amendment'])
             if snapshot.get('continuation_exposure_amendment') is not None else None)
+        budget_amendment = (Source.model_validate(snapshot['continuation_budget_amendment'])
+            if snapshot.get('continuation_budget_amendment') is not None else None)
+        timing_proposal = (Source.model_validate(snapshot['continuation_timing_proposal'])
+            if snapshot.get('continuation_timing_proposal') is not None else None)
+        resume_source = (Source.model_validate(snapshot['continuation_resume_source'])
+            if snapshot.get('continuation_resume_source') is not None else None)
         caps = Caps.model_validate(snapshot['caps'])
         if (card.continuation_authorization != continuation
                 or card.financial_policy_amendment != amendment
                 or continuation.sha256 != _O3_CONTINUATION_SHA256
                 or amendment.sha256 != _O2_AMENDMENT_SHA256
                 or exposure_amendment != card.continuation_exposure_amendment
+                or budget_amendment != card.continuation_budget_amendment
+                or timing_proposal != card.continuation_timing_proposal
+                or resume_source != card.continuation_resume_source
                 or caps != card.caps
                 or snapshot.get('batch_id') != card.batch_id
                 or snapshot.get('stage_id') != card.stage_id
@@ -759,13 +958,26 @@ def has_o3_continuation_cost_source(snapshot: Mapping[str, Any] | None, *, now: 
         correction = Source.model_validate(snapshot['legacy_usd_guard_correction'])
         exposure_amendment = (Source.model_validate(snapshot['continuation_exposure_amendment'])
             if snapshot.get('continuation_exposure_amendment') is not None else None)
+        budget_amendment = (Source.model_validate(snapshot['continuation_budget_amendment'])
+            if snapshot.get('continuation_budget_amendment') is not None else None)
+        timing_proposal = (Source.model_validate(snapshot['continuation_timing_proposal'])
+            if snapshot.get('continuation_timing_proposal') is not None else None)
+        resume_source = (Source.model_validate(snapshot['continuation_resume_source'])
+            if snapshot.get('continuation_resume_source') is not None else None)
         scope_id = snapshot.get('scope_id')
         if not isinstance(scope_id, str) or not scope_id.strip():
             return False
-        validate_o3_continuation_source(continuation, now=now, end=now)
+        validate_o3_continuation_source(continuation, now=now, end=now,
+            resume_source=resume_source,
+            budget_amendment=budget_amendment, timing_proposal=timing_proposal)
         validate_o3_legacy_usd_guard_source(correction)
         if exposure_amendment is not None:
             validate_o4_retry_cap_removal_source(exposure_amendment)
+        if any(value is None for value in (budget_amendment, timing_proposal, resume_source)) != all(
+                value is None for value in (budget_amendment, timing_proposal, resume_source)):
+            return False
+        if budget_amendment is not None and exposure_amendment is None:
+            return False
         return True
     except (FinancialError, ValueError, TypeError, KeyError):
         return False
@@ -812,6 +1024,9 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
     candidate_scope = snapshot.get('scope_id')
     candidate_source = snapshot.get('continuation_authorization')
     candidate_exposure_source = snapshot.get('continuation_exposure_amendment')
+    candidate_budget_source = snapshot.get('continuation_budget_amendment')
+    candidate_timing_source = snapshot.get('continuation_timing_proposal')
+    candidate_resume_source = snapshot.get('continuation_resume_source')
     if (not isinstance(candidate_authority, str) or not isinstance(candidate_stage, str)
             or not isinstance(candidate_scope, str) or not isinstance(candidate_source, Mapping)
             or candidate_source.get('sha256') != _O3_CONTINUATION_SHA256
@@ -820,6 +1035,20 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
     if candidate_exposure_source is not None:
         try:
             validate_o4_retry_cap_removal_source(Source.model_validate(candidate_exposure_source))
+        except (FinancialError, TypeError, ValueError):
+            raise FinancialError('financial_continuation_history_invalid') from None
+    candidate_o9_sources = (candidate_resume_source, candidate_budget_source, candidate_timing_source)
+    if any(value is None for value in candidate_o9_sources) != all(value is None for value in candidate_o9_sources):
+        raise FinancialError('financial_continuation_history_invalid')
+    if candidate_budget_source is not None and candidate_resume_source is not None:
+        try:
+            resume_ref = Source.model_validate(candidate_resume_source)
+            budget_ref = Source.model_validate(candidate_budget_source)
+            timing_ref = Source.model_validate(candidate_timing_source)
+            validate_o9_resume_source(resume_ref)
+            validate_o9_budget_amendment_source(budget_ref)
+            validate_o9_timing_proposal_source(timing_ref, budget_amendment=budget_ref,
+                resume_source=resume_ref)
         except (FinancialError, TypeError, ValueError):
             raise FinancialError('financial_continuation_history_invalid') from None
 
@@ -890,6 +1119,20 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
                 validate_o4_retry_cap_removal_source(card_exposure_source)
             except FinancialError:
                 raise FinancialError('financial_continuation_history_invalid') from None
+        card_budget_source = card.continuation_budget_amendment
+        card_timing_source = card.continuation_timing_proposal
+        card_resume_source = card.continuation_resume_source
+        card_o9_sources = (card_resume_source, card_budget_source, card_timing_source)
+        if any(value is None for value in card_o9_sources) != all(value is None for value in card_o9_sources):
+            raise FinancialError('financial_continuation_history_invalid')
+        if card_budget_source is not None and card_resume_source is not None:
+            try:
+                validate_o9_resume_source(card_resume_source)
+                validate_o9_budget_amendment_source(card_budget_source)
+                validate_o9_timing_proposal_source(card_timing_source,
+                    budget_amendment=card_budget_source, resume_source=card_resume_source)
+            except FinancialError:
+                raise FinancialError('financial_continuation_history_invalid') from None
         if amount(card.caps.stage_eur) != Decimal('16'):
             raise FinancialError('financial_continuation_history_invalid')
         if (card.caps.project_eur != first['caps'].get('project_eur')
@@ -903,6 +1146,15 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
                 or ((card.financial_policy_amendment.model_dump(mode='json')
                      if card.financial_policy_amendment is not None else None)
                     != first.get('financial_policy_amendment'))
+                or ((card_budget_source.model_dump(mode='json')
+                     if card_budget_source is not None else None)
+                    != first.get('continuation_budget_amendment'))
+                or ((card_timing_source.model_dump(mode='json')
+                     if card_timing_source is not None else None)
+                    != first.get('continuation_timing_proposal'))
+                or ((card_resume_source.model_dump(mode='json')
+                     if card_resume_source is not None else None)
+                    != first.get('continuation_resume_source'))
                 or any(row[1]['financial'].get('batch_id') != card.batch_id
                        or row[1]['financial'].get('stage_id') != card.stage_id
                        or row[1]['financial'].get('authority', {}).get('sha256') != authority_sha
@@ -910,6 +1162,15 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
                        or row[1]['financial'].get('continuation_exposure_amendment')
                           != (card_exposure_source.model_dump(mode='json')
                               if card_exposure_source is not None else None)
+                       or row[1]['financial'].get('continuation_budget_amendment')
+                          != (card_budget_source.model_dump(mode='json')
+                              if card_budget_source is not None else None)
+                       or row[1]['financial'].get('continuation_timing_proposal')
+                          != (card_timing_source.model_dump(mode='json')
+                              if card_timing_source is not None else None)
+                       or row[1]['financial'].get('continuation_resume_source')
+                          != (card_resume_source.model_dump(mode='json')
+                              if card_resume_source is not None else None)
                        for row in rows)):
             raise FinancialError('financial_continuation_history_invalid')
         if card.financial_policy_amendment is not None:
@@ -991,6 +1252,15 @@ def _validate_o3_continuation_history(state: Mapping[str, Any], snapshot: Mappin
             raise FinancialError('financial_continuation_history_invalid')
         if current_card.continuation_exposure_amendment != (
                 Source.model_validate(candidate_exposure_source) if candidate_exposure_source is not None else None):
+            raise FinancialError('financial_continuation_history_invalid')
+        if current_card.continuation_budget_amendment != (
+                Source.model_validate(candidate_budget_source) if candidate_budget_source is not None else None):
+            raise FinancialError('financial_continuation_history_invalid')
+        if current_card.continuation_timing_proposal != (
+                Source.model_validate(candidate_timing_source) if candidate_timing_source is not None else None):
+            raise FinancialError('financial_continuation_history_invalid')
+        if current_card.continuation_resume_source != (
+                Source.model_validate(candidate_resume_source) if candidate_resume_source is not None else None):
             raise FinancialError('financial_continuation_history_invalid')
     if len(base_allocations) != 2 or sum(base_allocations, Decimal(0)) != Decimal('32'):
         raise FinancialError('financial_continuation_history_invalid')
@@ -1120,6 +1390,28 @@ def validate_stored_commitment(record: dict, *, scope_id: str) -> None:
             if Source.model_validate(exposure_amendment).sha256 != _O4_RETRY_CAP_REMOVAL_SHA256:
                 raise ValueError('source hash differs')
         except (ValueError, TypeError):
+            raise FinancialError('financial_ledger_invalid') from None
+    budget_amendment = f.get('continuation_budget_amendment')
+    timing_proposal = f.get('continuation_timing_proposal')
+    resume_source = f.get('continuation_resume_source')
+    o9_sources = (resume_source, budget_amendment, timing_proposal)
+    if any(value is None for value in o9_sources) != all(value is None for value in o9_sources):
+        raise FinancialError('financial_ledger_invalid')
+    if budget_amendment is not None and resume_source is not None:
+        exposure_ref = f.get('continuation_exposure_amendment')
+        if (f.get('continuation_authorization') is None
+                or not isinstance(exposure_ref, Mapping)
+                or exposure_ref.get('sha256') != _O4_RETRY_CAP_REMOVAL_SHA256):
+            raise FinancialError('financial_ledger_invalid')
+        try:
+            budget_ref = Source.model_validate(budget_amendment)
+            timing_ref = Source.model_validate(timing_proposal)
+            resume_ref = Source.model_validate(resume_source)
+            validate_o9_resume_source(resume_ref)
+            validate_o9_budget_amendment_source(budget_ref)
+            validate_o9_timing_proposal_source(timing_ref, budget_amendment=budget_ref,
+                resume_source=resume_ref)
+        except (FinancialError, ValueError, TypeError):
             raise FinancialError('financial_ledger_invalid') from None
     Caps.model_validate(f['caps'])
     if (f['scope_id'] != scope_id or set(f['providers_eur']) != set(record['plan']['providers'])

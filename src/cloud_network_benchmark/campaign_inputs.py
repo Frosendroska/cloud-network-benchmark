@@ -613,8 +613,13 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     continuation_ref = settings.get("pricing", {}).get("continuation_authorization")
     guard_correction_ref = settings.get("pricing", {}).get("legacy_usd_guard_correction")
     exposure_amendment_ref = settings.get("pricing", {}).get("continuation_exposure_amendment")
+    resume_source_ref = settings.get("pricing", {}).get("continuation_resume_source")
+    budget_amendment_ref = settings.get("pricing", {}).get("continuation_budget_amendment")
+    timing_proposal_ref = settings.get("pricing", {}).get("continuation_timing_proposal")
     if request is None:
-        if continuation_ref is None and guard_correction_ref is None and exposure_amendment_ref is None:
+        if (continuation_ref is None and guard_correction_ref is None
+                and exposure_amendment_ref is None and budget_amendment_ref is None
+                and timing_proposal_ref is None and resume_source_ref is None):
             return None, None
         if continuation_ref is None or guard_correction_ref is None:
             raise ValueError("the S1/S3 USD guard correction requires both exact source-bound approvals")
@@ -622,16 +627,36 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
             raise ValueError("the source-bound S1/S3 continuation is limited to normal acceptance pricing")
         from .financial_controls import (FinancialAuthorization, Source,
             _validate_o2_amendment, stamp, validate_o3_continuation_source,
-            validate_o3_legacy_usd_guard_source, validate_o4_retry_cap_removal_source)
+            validate_o3_legacy_usd_guard_source, validate_o4_retry_cap_removal_source,
+            validate_o9_budget_amendment_source, validate_o9_timing_proposal_source,
+            validate_o9_resume_source)
         try:
             continuation = Source.model_validate(continuation_ref)
             correction = Source.model_validate(guard_correction_ref)
             exposure_amendment = (Source.model_validate(exposure_amendment_ref)
                 if exposure_amendment_ref is not None else None)
-            validate_o3_continuation_source(continuation, now=now, end=now)
+            budget_amendment = (Source.model_validate(budget_amendment_ref)
+                if budget_amendment_ref is not None else None)
+            timing_proposal = (Source.model_validate(timing_proposal_ref)
+                if timing_proposal_ref is not None else None)
+            resume_source = (Source.model_validate(resume_source_ref)
+                if resume_source_ref is not None else None)
+            validate_o3_continuation_source(continuation, now=now, end=now,
+                resume_source=resume_source, budget_amendment=budget_amendment,
+                timing_proposal=timing_proposal)
             validate_o3_legacy_usd_guard_source(correction)
             if exposure_amendment is not None:
                 validate_o4_retry_cap_removal_source(exposure_amendment)
+            o9_sources = (resume_source, budget_amendment, timing_proposal)
+            if any(value is None for value in o9_sources) != all(value is None for value in o9_sources):
+                raise ValueError("O9 resume, budget and timing sources must be supplied together")
+            if budget_amendment is not None and resume_source is not None:
+                if exposure_amendment is None:
+                    raise ValueError("O9 continuation also requires the preserved exact O4 exposure source")
+                validate_o9_resume_source(resume_source)
+                validate_o9_budget_amendment_source(budget_amendment)
+                validate_o9_timing_proposal_source(timing_proposal,
+                    budget_amendment=budget_amendment, resume_source=resume_source)
         except (TypeError, ValueError) as exc:
             raise ValueError("pricing S1/S3 guard sources do not match the exact approved continuation and correction") from exc
         scope_id = settings.get("ledger", {}).get("scope_id")
@@ -641,6 +666,10 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
             "legacy_usd_guard_correction": correction.model_dump(), "scope_id": scope_id}
         if exposure_amendment is not None:
             planning_snapshot["continuation_exposure_amendment"] = exposure_amendment.model_dump()
+        if budget_amendment is not None:
+            planning_snapshot["continuation_budget_amendment"] = budget_amendment.model_dump()
+            planning_snapshot["continuation_timing_proposal"] = timing_proposal.model_dump()
+            planning_snapshot["continuation_resume_source"] = resume_source.model_dump()
         if draft:
             return None, planning_snapshot
 
@@ -659,12 +688,16 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
             if (card.ledger_scope_id != scope_id
                     or card.continuation_authorization != continuation
                     or card.continuation_exposure_amendment != exposure_amendment
+                    or card.continuation_budget_amendment != budget_amendment
+                    or card.continuation_timing_proposal != timing_proposal
+                    or card.continuation_resume_source != resume_source
                     or stamp(card.approved_at) > current
                     or not stamp(card.valid_from) <= current < stamp(card.valid_until)):
                 raise ValueError("typed continuation authority identity or window differs")
             _validate_o2_amendment(card, now=current, end=current)
         except (TypeError, ValueError) as exc:
-            raise ValueError("non-draft continuation requires the exact current EUR400 typed card") from exc
+            card_limit = "EUR500" if budget_amendment is not None else "EUR400"
+            raise ValueError(f"non-draft continuation requires the exact current {card_limit} typed card") from exc
         paid_snapshot = {"authority": card_source.model_dump(),
             "continuation_authorization": card.continuation_authorization.model_dump(),
             "financial_policy_amendment": card.financial_policy_amendment.model_dump(),
@@ -673,8 +706,14 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
             "stage_id": card.stage_id, "scope_id": scope_id}
         if card.continuation_exposure_amendment is not None:
             paid_snapshot["continuation_exposure_amendment"] = card.continuation_exposure_amendment.model_dump()
+        if card.continuation_budget_amendment is not None:
+            paid_snapshot["continuation_budget_amendment"] = card.continuation_budget_amendment.model_dump()
+            paid_snapshot["continuation_timing_proposal"] = card.continuation_timing_proposal.model_dump()
+            paid_snapshot["continuation_resume_source"] = card.continuation_resume_source.model_dump()
         return None, paid_snapshot
-    if continuation_ref is not None or guard_correction_ref is not None or exposure_amendment_ref is not None:
+    if (continuation_ref is not None or guard_correction_ref is not None
+            or exposure_amendment_ref is not None or budget_amendment_ref is not None
+            or timing_proposal_ref is not None or resume_source_ref is not None):
         raise ValueError("the zero-new-reserve continuation cannot be combined with a reserve-release request")
     if not isinstance(request, dict):
         raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")

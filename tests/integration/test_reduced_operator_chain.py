@@ -395,7 +395,12 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     continuation_source_path = os.environ.get("CNB_O3_CONTINUATION_SOURCE_PATH")
     guard_correction_path = os.environ.get("CNB_O3_LEGACY_USD_GUARD_SOURCE_PATH")
     retry_cap_removal_path = os.environ.get("CNB_O4_RETRY_CAP_REMOVAL_SOURCE_PATH")
+    o9_resume_source_path = os.environ.get("CNB_O9_RESUME_SOURCE_PATH")
+    o9_budget_amendment_path = os.environ.get("CNB_O9_BUDGET_AMENDMENT_SOURCE_PATH")
+    o9_timing_proposal_path = os.environ.get("CNB_O9_TIMING_PROPOSAL_SOURCE_PATH")
+    o9_mode = all((o9_resume_source_path, o9_budget_amendment_path, o9_timing_proposal_path))
     native_history_sha256 = None
+    o9_native_history = False
     if native_history:
         snapshot_path = Path(native_history_source)
         if (not snapshot_path.is_absolute() or snapshot_path.is_symlink()
@@ -403,9 +408,14 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
             raise AssertionError("native O3 history snapshot must be an existing absolute non-symlink file")
         native_history_bytes = snapshot_path.read_bytes()
         native_history_sha256 = hashlib.sha256(native_history_bytes).hexdigest()
+        o9_native_history = (native_history_sha256
+            == "acd22f1eb13de85c24774e8d534a5298b34eadfeb816f76e1c73dfdbd2c9a3db")
+        if o9_mode and not o9_native_history:
+            raise AssertionError("O9 sources are qualified only against the immutable closed-702 ledger snapshot")
         if native_history_sha256 not in {
                 "607c3419063ed7ffca718b59b6aa7217c84e49e0103aad9f4ecb83947bef168c",
-                "497e552e6eab32822cffcf4ad857616d3693b04492a45c87d3e50160d6b5513e"}:
+                "497e552e6eab32822cffcf4ad857616d3693b04492a45c87d3e50160d6b5513e",
+                "acd22f1eb13de85c24774e8d534a5298b34eadfeb816f76e1c73dfdbd2c9a3db"}:
             raise AssertionError("native O3 history snapshot differs from the reviewed closed-ledger pin")
         copied_ledger_path = Path(settings["ledger"]["path"])
         if copied_ledger_path.resolve() == snapshot_path.resolve() or copied_ledger_path.exists():
@@ -417,6 +427,9 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         if (native_history_sha256 == "497e552e6eab32822cffcf4ad857616d3693b04492a45c87d3e50160d6b5513e"
                 and not retry_cap_removal_path):
             raise AssertionError("native closed-645 history qualification requires the genuine O4 cap-removal source")
+        if (native_history_sha256 == "acd22f1eb13de85c24774e8d534a5298b34eadfeb816f76e1c73dfdbd2c9a3db"
+                and (not retry_cap_removal_path or not o9_mode)):
+            raise AssertionError("native closed-702 qualification requires exact O4 and O9 sources")
         continuation_path = Path(continuation_source_path)
         continuation_sha256 = "3d30cf5eeb0b59714ffca6fd91cb315e87e9ae68caa232a11282e71d3d9ed49e"
         guard_path = Path(guard_correction_path)
@@ -441,6 +454,25 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
                 raise AssertionError("native O4 retry-cap removal source differs from its reviewed byte pin")
             settings["pricing"]["continuation_exposure_amendment"] = {
                 "path": str(retry_cap_path), "sha256": retry_cap_sha256}
+        if o9_mode:
+            o9_sources = [
+                (o9_resume_source_path, "c57cb62fc9da244d828b0bdc709a3a8676d0b9bc3ad4f1d595ecf086f8800c49"),
+                (o9_budget_amendment_path, "410ce512289aefcd8cb1bf54fa9453d76d726d191937596b9c44e294a5b4dd41"),
+                (o9_timing_proposal_path, "ec371e378160ae644cc6c3eee85166749a7c9bcb0f602b1c92e802ee522949b6"),
+            ]
+            for path, expected_sha in o9_sources:
+                source = Path(path)
+                if (not source.is_absolute() or source.is_symlink() or not source.is_file()
+                        or hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha):
+                    raise AssertionError("native O9 source bytes differ from their reviewed pins")
+            settings["pricing"].update({
+                "continuation_resume_source": {"path": o9_resume_source_path,
+                    "sha256": "c57cb62fc9da244d828b0bdc709a3a8676d0b9bc3ad4f1d595ecf086f8800c49"},
+                "continuation_budget_amendment": {"path": o9_budget_amendment_path,
+                    "sha256": "410ce512289aefcd8cb1bf54fa9453d76d726d191937596b9c44e294a5b4dd41"},
+                "continuation_timing_proposal": {"path": o9_timing_proposal_path,
+                    "sha256": "ec371e378160ae644cc6c3eee85166749a7c9bcb0f602b1c92e802ee522949b6"},
+            })
         retained = json.loads(native_history_bytes)
         consumed = {}
         for record in retained["reservations"].values():
@@ -490,10 +522,12 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
                 "diagnostic_day_authorized", "study_window"):
         settings["approvals"].pop(key, None)
 
-    # Keep the synthetic authorization inside O2's historical dispatch window;
+    # Keep the synthetic authorization inside its selected source-bound window;
     # no wall-clock time is used as a live readiness or dispatch claim.
-    now = datetime(2026, 11, 26, 22, 0, tzinfo=timezone.utc)
+    now = (datetime.now(timezone.utc).replace(microsecond=0) if native_history and o9_mode
+           else datetime(2026, 11, 26, 22, 0, tzinfo=timezone.utc))
     monkeypatch.setattr(Clock, "__init__", lambda self: setattr(self, "now", now))
+    settings["pricing"]["checked_on"] = now.date().isoformat()
     class FrozenDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -627,17 +661,19 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     auth_root = tmp_path / "synthetic-authority"
     auth_root.mkdir()
     _ledger, _plans, card, card_path = synthetic_finances(auth_root, count=2, paid=True)
-    valid_until = datetime(2026, 11, 27, 7, 0, tzinfo=timezone.utc)
+    valid_until = (datetime(2026, 11, 28, 7, 0, tzinfo=timezone.utc)
+        if o9_native_history else datetime(2026, 11, 27, 7, 0, tzinfo=timezone.utc))
     card.update(batch_id="fixed-pre-day-v1", stage_id=stage["stage_id"],
         ledger_scope_id=stage["scope_id"], approved_by="SYNTHETIC-OFFLINE-TEST",
         approved_at=now.isoformat(), valid_from=(now - timedelta(minutes=1)).isoformat(),
         valid_until=valid_until.isoformat(), approved_run_count=6,
         entries=[value for _entry, value in bindings])
-    card["caps"].update(project_eur="400",
-        working_eur="400" if native_history else "302", protected_eur="0",
-        personal_cash_eur="400", run_eur="8",
-        batch_eur="400" if native_history else "233", stage_eur="16",
-        providers_eur={provider: "400" if native_history else "16"
+    continuation_ceiling = "500" if o9_native_history else "400"
+    card["caps"].update(project_eur=continuation_ceiling,
+        working_eur=continuation_ceiling if native_history else "302", protected_eur="0",
+        personal_cash_eur=continuation_ceiling, run_eur="8",
+        batch_eur=continuation_ceiling if native_history else "233", stage_eur="16",
+        providers_eur={provider: continuation_ceiling if native_history else "16"
             for provider in ("aws", "azure", "gcp")})
     cost_file = Path(stage["cost_input_path"])
     from cloud_network_benchmark.admission import load_cost_inputs
@@ -688,11 +724,15 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         if retry_cap_removal_path:
             card["continuation_exposure_amendment"] = {
                 "path": str(retry_cap_path), "sha256": retry_cap_sha256}
+        if o9_native_history:
+            card["continuation_resume_source"] = settings["pricing"]["continuation_resume_source"]
+            card["continuation_budget_amendment"] = settings["pricing"]["continuation_budget_amendment"]
+            card["continuation_timing_proposal"] = settings["pricing"]["continuation_timing_proposal"]
     # Exercise the production financial validator against the genuine native
     # EUR400 source as a negative boundary: the overall cap rose, but existing
     # working headroom did not. The normal card below uses the approved EUR302.
     over_working = copy.deepcopy(card)
-    over_working["caps"]["working_eur"] = "401" if native_history else "303"
+    over_working["caps"]["working_eur"] = ("501" if o9_native_history else "401") if native_history else "303"
     over_working_path = auth_root / "SYNTHETIC-O2-over-working-cap.json"
     over_working_path.write_text(json.dumps(over_working, sort_keys=True) + "\n")
     over_working_ref = {"source_path": str(over_working_path),
@@ -1099,6 +1139,13 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
             "continuation_exposure_amendment", None)
         with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
             check_shared_finances(partially_unbound, authorized_record["financial"], remaining_usd=Decimal("0"))
+        if o9_native_history:
+            partially_unbound_o9 = copy.deepcopy(ledger_state)
+            partially_unbound_o9["reservations"][current_o4_rows[1][0]]["financial"].pop(
+                "continuation_budget_amendment", None)
+            with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
+                check_shared_finances(partially_unbound_o9, authorized_record["financial"],
+                    remaining_usd=Decimal("0"))
         assert financial_ledger_path.read_bytes() == financial_ledger_bytes
 
     # Bind the conditional CAL prerequisite to the real closed acceptance output.
