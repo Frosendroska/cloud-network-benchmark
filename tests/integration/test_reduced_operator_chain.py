@@ -1184,6 +1184,9 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     cal_settings["pricing"].pop("continuation_authorization", None)
     cal_settings["pricing"].pop("legacy_usd_guard_correction", None)
     cal_settings["pricing"].pop("continuation_exposure_amendment", None)
+    cal_settings["pricing"].pop("continuation_resume_source", None)
+    cal_settings["pricing"].pop("continuation_budget_amendment", None)
+    cal_settings["pricing"].pop("continuation_timing_proposal", None)
     cal_settings["pricing"]["funding"]["uncertainty"] = "0"
     cal_settings["state_root"] = str(tmp_path / "calibration-private")
     cal_settings["ledger"]["path"] = str(Path(cal_settings["state_root"]) / "ledger.json")
