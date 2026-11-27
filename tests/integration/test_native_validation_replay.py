@@ -76,7 +76,8 @@ def test_materialized_jsonl_records_are_consumed_incrementally(tmp_path):
 def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, deterministic_token,
                                 fake_git_commits, request, *, config_name="exp-001-multi-provider.yaml",
                                 mode_override=None, provider="aws", frozen_n=False, shared_slot=False,
-                                day_capture_seconds=None):
+                                day_capture_seconds=None, initialized_campaign=None,
+                                initialized_config_path=None):
     from tests.unit.test_validation import NOW, make_input
 
     config_folder = "tests" if mode_override == "acceptance" else "experiments"
@@ -88,9 +89,15 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         config_data["benchmark"]["common_n"]={"state":"frozen","common_n":4,
             "source_campaign_id":"prior-calibration-campaign","source_sha256":"d"*64,"plateau_found":True}
     config_data["scheduled_start"]="2026-10-21T00:00:00Z"
-    config_path=repository_root/"configs/tests"/f"f08-{tmp_path.name}-{provider}.yaml"
-    request.addfinalizer(lambda: config_path.unlink(missing_ok=True))
-    config_path.write_text(yaml.safe_dump(config_data,sort_keys=False))
+    if initialized_campaign is None:
+        config_path=repository_root/"configs/tests"/f"f08-{tmp_path.name}-{provider}.yaml"
+        request.addfinalizer(lambda: config_path.unlink(missing_ok=True))
+        config_path.write_text(yaml.safe_dump(config_data,sort_keys=False))
+    else:
+        if initialized_config_path is None:
+            raise ValueError("initialized campaign materialization requires its source config path")
+        config_path=Path(initialized_config_path)
+        config_data=yaml.safe_load(config_path.read_text())
     entry_id="f08-shared-short-study" if shared_slot else f"f08-{tmp_path.name}-{provider}"
     row=f"{entry_id},{config_data['experiment_id']},{config_data['config_id']}"
     schedule=ScheduleEntry(schema_version=2,entry_id=entry_id,config_id=config_data["config_id"],
@@ -99,7 +106,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         source_sha256=hashlib.sha256(b"synthetic F08 schedule fixture").hexdigest(),
         row_sha256=hashlib.sha256(row.encode()).hexdigest(),original_header="entry_id,experiment_id,config_id",
         original_row=row,columns=["entry_id","experiment_id","config_id"],priority="P0")
-    initialized = initialize_campaign(config_path,
+    initialized = initialized_campaign or initialize_campaign(config_path,
         repository_root, tmp_path / "results", frozen_clock, deterministic_token,
         StaticGitProvenance(fake_git_commits["implementation"]), StaticGitProvenance(fake_git_commits["design"]),
         schedule_entry=schedule)

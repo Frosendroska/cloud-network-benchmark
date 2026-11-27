@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+from datetime import datetime, timedelta
 
 import pytest
 from pathlib import Path
@@ -145,6 +146,121 @@ def test_closed_failed_provider_export_keeps_valid_sibling_native_runs(
     assert by_provider["gcp"]["current_data_validity"] == "valid", json.dumps(
         [item for item in report.payload["findings"] if item["run_id"] == materialized["gcp"][0].identity.run_id],
         indent=2)
+
+
+def test_failed_three_provider_entry_keeps_valid_siblings_in_aggregate_export(
+        repository_root, tmp_path, frozen_clock, deterministic_token, fake_git_commits, request):
+    """A failed logical entry remains exportable with exact valid and invalid native siblings."""
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+    from cloud_network_benchmark.campaign_export import (
+        aggregate_closed_exports, export_selection, verify_export)
+    from cloud_network_benchmark.lifecycle_bundle import seal_bundle
+    from cloud_network_benchmark.validation import validate_bundle
+    from cloud_network_benchmark.manifests import (
+        StaticGitProvenance, initialize_campaign, recompute_parent_manifest)
+    from cloud_network_benchmark.contracts.admission import ScheduleEntry
+    from tests.unit.test_validation import NOW
+    import yaml
+
+    shared_config = repository_root / "configs/tests" / f"f08-{tmp_path.name}-all-providers.yaml"
+    config_data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    config_data["benchmark"]["common_n"] = {"state": "frozen", "common_n": 4,
+        "source_campaign_id": "prior-calibration-campaign", "source_sha256": "d" * 64,
+        "plateau_found": True}
+    config_data["scheduled_start"] = "2026-10-21T00:00:00Z"
+    shared_config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    request.addfinalizer(lambda: shared_config.unlink(missing_ok=True))
+    entry_id = "f08-shared-short-study"
+    row = f"{entry_id},{config_data['experiment_id']},{config_data['config_id']}"
+    schedule = ScheduleEntry(schema_version=2, entry_id=entry_id,
+        config_id=config_data["config_id"], experiment_id=config_data["experiment_id"],
+        scheduled_start=datetime(2026, 10, 21, tzinfo=NOW.tzinfo), window_label="morning",
+        source_path="tests/fixtures/f08/schedule.csv",
+        source_sha256=hashlib.sha256(b"synthetic F08 schedule fixture").hexdigest(),
+        row_sha256=hashlib.sha256(row.encode()).hexdigest(),
+        original_header="entry_id,experiment_id,config_id", original_row=row,
+        columns=["entry_id", "experiment_id", "config_id"], priority="P0")
+    initialized = initialize_campaign(shared_config, repository_root, tmp_path / "shared-results",
+        frozen_clock, deterministic_token,
+        StaticGitProvenance(fake_git_commits["implementation"]),
+        StaticGitProvenance(fake_git_commits["design"]), schedule_entry=schedule)
+
+    materialized = {}
+    for provider in ("aws", "azure", "gcp"):
+        complete, result, _ = materialize_f08_pair(repository_root, tmp_path / provider,
+            frozen_clock, deterministic_token, fake_git_commits, request,
+            mode="short_study", provider=provider, shared_slot=True,
+            config_name="exp-001-multi-provider.yaml", initialized_campaign=initialized,
+            initialized_config_path=shared_config)
+        root = Path(complete.child_result_root)
+        if provider == "azure":
+            record = next(item for item in complete.artifact_records if item.kind == "sockperf-csv")
+            native_path = root / record.path
+            native_path.write_bytes(native_path.read_bytes() + b"\n")
+            result = validate_bundle(complete, evaluated_at=result.evaluated_at)
+            assert result.validation_status.data_validity == "invalid"
+        else:
+            assert result.validation_status.data_validity == "valid"
+        validation = root / "validation"
+        validation.mkdir(exist_ok=True)
+        (validation / "input.json").write_text(complete.model_dump_json(), encoding="utf-8")
+        (validation / "result.json").write_text(result.model_dump_json(), encoding="utf-8")
+        seal_bundle(root)
+        materialized[provider] = (complete, result, root)
+
+    parent_path = Path(initialized.parent_manifest_path)
+    parent_doc = json.loads(parent_path.read_text(encoding="utf-8"))
+    run_ids = {row["provider"]: row["run_id"] for row in parent_doc["child_runs"]}
+    assert run_ids == {provider: bundle.identity.run_id
+        for provider, (bundle, _, _) in materialized.items()}
+    for provider, (bundle, _, _) in materialized.items():
+        parent_ref = next(row for row in parent_doc["child_runs"] if row["provider"] == provider)
+        assert Path(parent_ref["manifest_path"]).resolve() == Path(bundle.child_manifest_path).resolve()
+    parent_updated = datetime.fromisoformat(parent_doc["updated_at"].replace("Z", "+00:00"))
+    shared_parent = recompute_parent_manifest(parent_path, parent_updated + timedelta(seconds=1),
+        "test fixture linked existing finalized provider child manifests")
+    assert str(shared_parent.aggregate_state) == "succeeded"
+    parent_doc = json.loads(parent_path.read_text(encoding="utf-8"))
+
+    common_results = tmp_path / "campaign-results"
+    (common_results / "raw").mkdir(parents=True)
+    for provider, (bundle, _, root) in materialized.items():
+        shutil.copytree(root, common_results / "raw" / bundle.identity.run_id)
+        source_child = next(row for row in parent_doc["child_runs"] if row["provider"] == provider)
+        assert Path(repository_root / source_child["manifest_path"]).is_file()
+
+    entry = {"entry_id": "slot-all-clouds", "parent_manifest_path": str(parent_path),
+        "run_ids": run_ids}
+    stage = {"stage_id": "failed-three-provider-slot", "stage": "week",
+        "repository_root": str(repository_root), "results_root": str(common_results),
+        "entries": [entry]}
+    journal = {"entries": {entry["entry_id"]: {"state": "failed",
+        "error": "Azure native Sockperf CSV failed canonical validation",
+        "result": {"cleanup_open": False}}}}
+
+    closed_export = common_results / "closed" / entry["entry_id"] / "export"
+    selection = export_selection(stage, closed_export)
+    assert selection is not None and verify_export(closed_export)
+    selected_rows = json.loads(selection.read_text(encoding="utf-8"))["runs"]
+    assert len(selected_rows) == 3
+    for provider, (bundle, _, root) in materialized.items():
+        exported_root = closed_export / "runs" / bundle.identity.run_id
+        for record in bundle.artifact_records:
+            source = root / record.path
+            target = exported_root / record.path
+            assert source.is_file() and target.is_file()
+            assert hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256(target.read_bytes()).digest(), (
+                provider, record.artifact_id, record.path)
+
+    aggregate_selection = aggregate_closed_exports(stage, journal, common_results / "export")
+    assert aggregate_selection is not None and verify_export(aggregate_selection.parent)
+    report = analyze_selection(aggregate_selection,
+        analysis_git=materialized["aws"][0].implementation_git)
+    by_provider = {row["provider"]: row for row in report.payload["runs"]}
+    assert {row["run_id"] for row in report.payload["runs"]} == set(run_ids.values())
+    assert {provider: row["current_data_validity"] for provider, row in by_provider.items()} == {
+        "aws": "valid", "azure": "invalid", "gcp": "valid"}
 
 
 def test_corrupted_export_copy_is_rejected_and_original_bytes_remain(tmp_path, monkeypatch):
